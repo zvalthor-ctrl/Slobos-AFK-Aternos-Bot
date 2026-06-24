@@ -1359,7 +1359,9 @@ function createBot() {
       const msg = err.message || "";
       addLog(`[Bot] Error: ${msg}`);
       botState.errors.push({ type: "error", message: msg, time: Date.now() });
-      // Don't reconnect on error - let 'end' event handle it
+      // Trigger reconnect here too — 'end' doesn't always fire after 'error'
+      // scheduleReconnect() is safe to call here: its isReconnecting guard prevents double-scheduling
+      scheduleReconnect();
     });
   } catch (err) {
     addLog(`[Bot] Failed to create bot: ${err.message}`);
@@ -2114,3 +2116,12 @@ addLog(
 addLog("=".repeat(50));
 
 createBot();
+
+// Watchdog : toutes les 45s, si le bot n'est ni connecté ni en train de reconnecter → force la reconnexion
+setInterval(() => {
+  if (!botState.connected && !isReconnecting && !reconnectTimeoutId) {
+    addLog("[Watchdog] Bot bloqué détecté — reconnexion forcée...");
+    botState.reconnectAttempts = 0;
+    scheduleReconnect();
+  }
+}, 45000);
