@@ -1556,12 +1556,42 @@ function initializeModules(bot, mcData, defaultMove) {
       );
     }
 
+    // Sneak occasionnel (pas permanent) - un humain ne reste pas toujours accroupi
     if (config.utils["anti-afk"].sneak) {
-      try {
-        if (typeof bot.setControlState === "function")
-          bot.setControlState("sneak", true);
-      } catch (e) {}
+      const scheduleSneak = () => {
+        const delay = 45000 + Math.floor(Math.random() * 90000);
+        setTimeout(() => {
+          if (!bot || !botState.connected || typeof bot.setControlState !== "function") {
+            scheduleSneak(); return;
+          }
+          try {
+            bot.setControlState("sneak", true);
+            const dur = 2000 + Math.floor(Math.random() * 6000);
+            setTimeout(() => {
+              try { if (bot) bot.setControlState("sneak", false); } catch(e) {}
+              scheduleSneak();
+            }, dur);
+          } catch(e) { scheduleSneak(); }
+        }, delay);
+      };
+      scheduleSneak();
     }
+
+    // Ouverture aléatoire de l'inventaire (comportement humain typique)
+    const scheduleInventory = () => {
+      const delay = 180000 + Math.floor(Math.random() * 300000);
+      setTimeout(() => {
+        if (!bot || !botState.connected) { scheduleInventory(); return; }
+        try {
+          bot.openInventory && bot.openInventory();
+          setTimeout(() => {
+            try { if (bot && bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch(e) {}
+            scheduleInventory();
+          }, 2000 + Math.floor(Math.random() * 4000));
+        } catch(e) { scheduleInventory(); }
+      }, delay);
+    };
+    scheduleInventory();
   }
 
   // ---------- MOVEMENT MODULES ----------
@@ -1616,66 +1646,99 @@ function initializeModules(bot, mcData, defaultMove) {
 // ============================================================
 function startCircleWalk(bot, defaultMove) {
   const radius = config.movement["circle-walk"].radius;
-  let angle = 0;
-  let lastPathTime = 0;
+  const baseSpeed = config.movement["circle-walk"].speed;
+  let originX = null;
+  let originZ = null;
+  let isPaused = false;
 
-  addInterval(() => {
+  const scheduleNext = () => {
     if (!bot || !botState.connected) return;
-    const now = Date.now();
-    if (now - lastPathTime < 2000) return;
-    lastPathTime = now;
+    const jitter = Math.floor(Math.random() * baseSpeed * 0.8);
+    const delay = baseSpeed + jitter;
+    setTimeout(doStep, delay);
+  };
+
+  const doStep = () => {
+    if (!bot || !botState.connected) { scheduleNext(); return; }
+
+    if (originX === null) {
+      originX = bot.entity.position.x;
+      originZ = bot.entity.position.z;
+    }
+
+    if (isPaused) { scheduleNext(); return; }
+
     try {
-      const x = bot.entity.position.x + Math.cos(angle) * radius;
-      const z = bot.entity.position.z + Math.sin(angle) * radius;
+      const angle = Math.random() * Math.PI * 2;
+      const dist  = (0.4 + Math.random() * 0.6) * radius;
+      const x = originX + Math.cos(angle) * dist;
+      const z = originZ + Math.sin(angle) * dist;
+
       bot.pathfinder.setMovements(defaultMove);
       bot.pathfinder.setGoal(
-        new GoalBlock(
-          Math.floor(x),
-          Math.floor(bot.entity.position.y),
-          Math.floor(z),
-        ),
+        new GoalBlock(Math.floor(x), Math.floor(bot.entity.position.y), Math.floor(z))
       );
-      angle += Math.PI / 4;
       botState.lastActivity = Date.now();
     } catch (e) {
-      addLog("[CircleWalk] Error:", e.message);
+      addLog("[Walk] Error:", e.message);
     }
-  }, config.movement["circle-walk"].speed);
+    scheduleNext();
+  };
+
+  const schedulePause = () => {
+    const pauseIn = 120000 + Math.floor(Math.random() * 180000);
+    setTimeout(() => {
+      if (!bot || !botState.connected) { schedulePause(); return; }
+      isPaused = true;
+      try { bot.pathfinder.setGoal(null); } catch(e) {}
+      const pauseDur = 15000 + Math.floor(Math.random() * 45000);
+      addLog(`[Walk] Pausing movement for ${Math.round(pauseDur/1000)}s`);
+      setTimeout(() => { isPaused = false; schedulePause(); }, pauseDur);
+    }, pauseIn);
+  };
+
+  doStep();
+  schedulePause();
 }
 
 function startRandomJump(bot) {
-  addInterval(() => {
-    if (
-      !bot ||
-      !botState.connected ||
-      typeof bot.setControlState !== "function"
-    )
-      return;
-    try {
-      bot.setControlState("jump", true);
-      setTimeout(() => {
-        if (bot && typeof bot.setControlState === "function")
-          bot.setControlState("jump", false);
-      }, 300);
-      botState.lastActivity = Date.now();
-    } catch (e) {
-      addLog("[RandomJump] Error:", e.message);
-    }
-  }, config.movement["random-jump"].interval);
+  const scheduleJump = () => {
+    const base = config.movement["random-jump"].interval;
+    const delay = base * 0.5 + Math.floor(Math.random() * base * 1.5);
+    setTimeout(() => {
+      if (!bot || !botState.connected || typeof bot.setControlState !== "function") {
+        scheduleJump(); return;
+      }
+      try {
+        bot.setControlState("jump", true);
+        setTimeout(() => {
+          if (bot && typeof bot.setControlState === "function")
+            bot.setControlState("jump", false);
+        }, 200 + Math.floor(Math.random() * 200));
+        botState.lastActivity = Date.now();
+      } catch (e) {}
+      scheduleJump();
+    }, delay);
+  };
+  scheduleJump();
 }
 
 function startLookAround(bot) {
-  addInterval(() => {
-    if (!bot || !botState.connected) return;
-    try {
-      const yaw = Math.random() * Math.PI * 2 - Math.PI;
-      const pitch = (Math.random() * Math.PI) / 2 - Math.PI / 4;
-      bot.look(yaw, pitch, false);
-      botState.lastActivity = Date.now();
-    } catch (e) {
-      addLog("[LookAround] Error:", e.message);
-    }
-  }, config.movement["look-around"].interval);
+  const scheduleLook = () => {
+    const base = config.movement["look-around"].interval;
+    const delay = base * 0.4 + Math.floor(Math.random() * base * 2.5);
+    setTimeout(() => {
+      if (!bot || !botState.connected) { scheduleLook(); return; }
+      try {
+        const yaw   = Math.random() * Math.PI * 2 - Math.PI;
+        const pitch = (Math.random() - 0.5) * (Math.PI / 2);
+        bot.look(yaw, pitch, false);
+        botState.lastActivity = Date.now();
+      } catch (e) {}
+      scheduleLook();
+    }, delay);
+  };
+  scheduleLook();
 }
 
 // ============================================================
