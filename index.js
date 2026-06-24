@@ -979,8 +979,10 @@ app.post("/start", (req, res) => {
   if (botRunning) return res.json({ success: false, msg: "Already running" });
 
   botRunning = true;
+  isReconnecting = false;
+  botState.reconnectAttempts = 0;
+  addLog("[Control] Bot started — reconnexion automatique activée.");
   createBot();
-  addLog("[Control] Bot started");
 
   res.json({ success: true });
 });
@@ -989,14 +991,18 @@ app.post("/stop", (req, res) => {
   if (!botRunning) return res.json({ success: false, msg: "Already stopped" });
 
   botRunning = false;
+  isReconnecting = false;
+  clearBotTimeouts();
 
   if (bot) {
-    bot.end();
+    try { bot.removeAllListeners(); bot.end(); } catch(e) {}
     bot = null;
   }
 
   clearAllIntervals();
-  addLog("[Control] Bot stopped");
+  botState.connected = false;
+  botState.reconnectAttempts = 0;
+  addLog("[Control] Bot stopped — reconnexion automatique désactivée.");
 
   res.json({ success: true });
 });
@@ -1370,6 +1376,12 @@ function createBot() {
 }
 
 function scheduleReconnect() {
+  // Ne jamais reconnecter si l'utilisateur a cliqué sur Stop
+  if (!botRunning) {
+    addLog("[Bot] Reconnect skipped — bot stopped by user.");
+    return;
+  }
+
   clearBotTimeouts();
 
   // FIX: don't stack reconnect if already waiting
@@ -1383,13 +1395,13 @@ function scheduleReconnect() {
 
   const delay = getReconnectDelay();
   addLog(
-    `[Bot] Reconnecting in ${delay / 1000}s (attempt #${botState.reconnectAttempts})`,
+    `[Bot] Reconnecting in ${(delay / 1000).toFixed(1)}s (attempt #${botState.reconnectAttempts})`,
   );
 
   reconnectTimeoutId = setTimeout(() => {
     reconnectTimeoutId = null;
     isReconnecting = false;
-    createBot();
+    if (botRunning) createBot();
   }, delay);
 }
 
@@ -2117,11 +2129,11 @@ addLog("=".repeat(50));
 
 createBot();
 
-// Watchdog : toutes les 45s, si le bot n'est ni connecté ni en train de reconnecter → force la reconnexion
+// Watchdog : toutes les 30s, si l'utilisateur veut le bot mais qu'il n'est ni connecté ni en cours de reconnexion → force
 setInterval(() => {
-  if (!botState.connected && !isReconnecting && !reconnectTimeoutId) {
+  if (botRunning && !botState.connected && !isReconnecting && !reconnectTimeoutId) {
     addLog("[Watchdog] Bot bloqué détecté — reconnexion forcée...");
     botState.reconnectAttempts = 0;
     scheduleReconnect();
   }
-}, 45000);
+}, 30000);
