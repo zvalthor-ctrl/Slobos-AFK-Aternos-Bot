@@ -1444,26 +1444,8 @@ function initializeModules(bot, mcData, defaultMove) {
     }, 10000);
   }
 
-  // ---------- CHAT MESSAGES ----------
-  if (config.utils["chat-messages"] && config.utils["chat-messages"].enabled) {
-    const messages = config.utils["chat-messages"].messages;
-    if (config.utils["chat-messages"].repeat) {
-      let i = 0;
-      addInterval(() => {
-        if (bot && botState.connected) {
-          bot.chat(messages[i]);
-          botState.lastActivity = Date.now();
-          i = (i + 1) % messages.length;
-        }
-      }, config.utils["chat-messages"]["repeat-delay"] * 1000);
-    } else {
-      messages.forEach((msg, idx) => {
-        setTimeout(() => {
-          if (bot && botState.connected) bot.chat(msg);
-        }, idx * 1000);
-      });
-    }
-  }
+  // ---------- CHAT MESSAGES (DISABLED - bot ne doit pas envoyer de messages dans le tchat) ----------
+  // if (config.utils["chat-messages"] && config.utils["chat-messages"].enabled) { ... }
 
   // ---------- MOVE TO POSITION ----------
   // FIX: only use position goal if circle-walk is NOT enabled (they fight over pathfinder)
@@ -1867,16 +1849,8 @@ function chatModule(bot) {
         sendDiscordWebhook(`💬 **${username}**: ${message}`, 0x7289da);
       }
 
-      if (config.chat && config.chat.respond) {
-        const lowerMsg = message.toLowerCase();
-        if (lowerMsg.includes("hello") || lowerMsg.includes("hi")) {
-          bot.chat(`Hello, ${username}!`);
-        }
-        if (message.startsWith("!tp ")) {
-          const target = message.split(" ")[1];
-          if (target) bot.chat(`/tp ${target}`);
-        }
-      }
+      // Réponses automatiques désactivées (bot ne doit pas envoyer de messages dans le tchat)
+      // if (config.chat && config.chat.respond) { ... }
     } catch (e) {
       addLog("[Chat] Error:", e.message);
     }
