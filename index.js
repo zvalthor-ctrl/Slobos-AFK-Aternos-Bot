@@ -464,14 +464,42 @@ app.get("/tutorial", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
+  const mainConnected = botState.connected;
+  const extraConnected = extraBots.filter((b) => b.isConnected()).length;
+  const totalConnected = (mainConnected ? 1 : 0) + extraConnected;
+  const baseName = (config["bot-account"].username || "Bot").replace(/\d+$/, "");
   res.json({
-    status: botState.connected ? "connected" : "disconnected",
+    status: mainConnected ? "connected" : "disconnected",
     uptime: Math.floor((Date.now() - botState.startTime) / 1000),
     coords: bot && bot.entity ? bot.entity.position : null,
     lastActivity: botState.lastActivity,
     reconnectAttempts: botState.reconnectAttempts,
     memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024,
+    botCount: TOTAL_BOTS,
+    connectedCount: totalConnected,
+    bots: [
+      { index: 0, username: baseName + "00", connected: mainConnected },
+      ...extraBots.map((b) => ({ index: b.index, username: b.username, connected: b.isConnected() })),
+    ],
   });
+});
+
+app.post("/set-bot-count", express.json(), (req, res) => {
+  const count = parseInt(req.body.count, 10);
+  if (isNaN(count) || count < 1 || count > 10)
+    return res.json({ success: false, msg: "Nombre invalide (1-10)." });
+
+  const fs = require("fs");
+  try {
+    const raw = fs.readFileSync("settings.json", "utf8");
+    const cfg = JSON.parse(raw);
+    cfg["bot-count"] = count;
+    fs.writeFileSync("settings.json", JSON.stringify(cfg, null, 2));
+    addLog(`[Config] Nombre de bots changé → ${count}. Redémarrez l'application pour appliquer.`);
+    res.json({ success: true, msg: `Nombre de bots mis à jour : ${count}. Redémarrez pour appliquer.` });
+  } catch (e) {
+    res.json({ success: false, msg: "Erreur lecture settings.json : " + e.message });
+  }
 });
 
 app.get("/ping", (req, res) => res.send("pong"));
@@ -981,8 +1009,9 @@ app.post("/start", (req, res) => {
   botRunning = true;
   isReconnecting = false;
   botState.reconnectAttempts = 0;
-  addLog("[Control] Bot started — reconnexion automatique activée.");
+  addLog(`[Control] Démarrage de ${TOTAL_BOTS} bot(s) — reconnexion automatique activée.`);
   createBot();
+  extraBots.forEach((b) => b.start());
 
   res.json({ success: true });
 });
@@ -1002,7 +1031,8 @@ app.post("/stop", (req, res) => {
   clearAllIntervals();
   botState.connected = false;
   botState.reconnectAttempts = 0;
-  addLog("[Control] Bot stopped — reconnexion automatique désactivée.");
+  extraBots.forEach((b) => b.stop());
+  addLog(`[Control] ${TOTAL_BOTS} bot(s) arrêtés — reconnexion automatique désactivée.`);
 
   res.json({ success: true });
 });
@@ -1129,6 +1159,124 @@ setInterval(
   },
   5 * 60 * 1000,
 );
+
+// ============================================================
+// MULTI-BOT EXTRA INSTANCES
+// ============================================================
+const TOTAL_BOTS = Math.max(1, Math.min(10, config["bot-count"] || 1));
+
+function makeExtraBot(index) {
+  const base = (config["bot-account"].username || "Bot").replace(/\d+$/, "");
+  const username = base + String(index).padStart(2, "0");
+  let eBot = null;
+  let connected = false;
+  let isRecon = false;
+  let reconTimer = null;
+  let attempts = 0;
+  let running = false;
+
+  function cleanup() {
+    if (eBot) {
+      try { eBot.removeAllListeners(); eBot.end(); } catch(e) {}
+      eBot = null;
+    }
+    connected = false;
+  }
+
+  function schedRecon() {
+    if (!running || isRecon) return;
+    isRecon = true;
+    attempts++;
+    const delay = Math.min(2000 * Math.pow(2, attempts - 1), 30000) + Math.floor(Math.random() * 2000);
+    addLog(`[Bot#${index}] Reconnecting in ${(delay / 1000).toFixed(1)}s (attempt #${attempts})`);
+    reconTimer = setTimeout(() => {
+      isRecon = false;
+      reconTimer = null;
+      if (running) connect();
+    }, delay);
+  }
+
+  function connect() {
+    cleanup();
+    if (!running) return;
+    addLog(`[Bot#${index}] Connecting as ${username}...`);
+    try {
+      const ver = config.server.version && config.server.version.trim() ? config.server.version : false;
+      eBot = mineflayer.createBot({
+        username,
+        password: config["bot-account"].password || undefined,
+        auth: config["bot-account"].type,
+        host: config.server.ip,
+        port: config.server.port,
+        version: ver,
+        hideErrors: false,
+        checkTimeoutInterval: 600000,
+      });
+
+      const spawnTimeout = setTimeout(() => {
+        if (!connected) { addLog(`[Bot#${index}] Spawn timeout`); schedRecon(); }
+      }, 90000);
+
+      eBot.once("spawn", () => {
+        clearTimeout(spawnTimeout);
+        connected = true;
+        attempts = 0;
+        addLog(`[Bot#${index}] ✓ Connecté en tant que ${username}`);
+
+        // Auto-auth
+        if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
+          setTimeout(() => {
+            if (eBot && connected) {
+              try { eBot.chat(`/login ${config.utils["auto-auth"].password}`); } catch(e) {}
+            }
+          }, 10500 + index * 500);
+        }
+
+        // Anti-AFK basique
+        const afkInterval = setInterval(() => {
+          if (!eBot || !connected) { clearInterval(afkInterval); return; }
+          try {
+            eBot.swingArm();
+            eBot.look(Math.random() * Math.PI * 2 - Math.PI, (Math.random() - 0.5) * Math.PI / 2, false);
+            if (Math.random() > 0.7 && typeof eBot.setControlState === "function") {
+              eBot.setControlState("sneak", true);
+              setTimeout(() => { try { if (eBot) eBot.setControlState("sneak", false); } catch(e) {} }, 1500 + Math.random() * 2000);
+            }
+          } catch(e) {}
+        }, 12000 + Math.floor(Math.random() * 18000));
+      });
+
+      eBot.on("end", () => { connected = false; schedRecon(); });
+      eBot.on("error", () => { schedRecon(); });
+    } catch(e) {
+      addLog(`[Bot#${index}] Erreur: ${e.message}`);
+      schedRecon();
+    }
+  }
+
+  // Watchdog for extra bots
+  setInterval(() => {
+    if (running && !connected && !isRecon && !reconTimer) {
+      addLog(`[Bot#${index}] Watchdog: reconnexion forcée`);
+      attempts = 0;
+      schedRecon();
+    }
+  }, 30000);
+
+  return {
+    start()      { running = true; attempts = 0; connect(); },
+    stop()       { running = false; isRecon = false; if (reconTimer) { clearTimeout(reconTimer); reconTimer = null; } cleanup(); },
+    isConnected: () => connected,
+    username,
+    index,
+  };
+}
+
+// Créer les bots supplémentaires (index 1..N-1, le bot principal est l'index 0)
+const extraBots = [];
+for (let i = 1; i < TOTAL_BOTS; i++) {
+  extraBots.push(makeExtraBot(i));
+}
 
 // ============================================================
 // BOT CREATION WITH RECONNECTION LOGIC
@@ -2127,7 +2275,9 @@ addLog(
 );
 addLog("=".repeat(50));
 
+addLog(`[Multi-bot] ${TOTAL_BOTS} bot(s) configuré(s).`);
 createBot();
+extraBots.forEach((b) => b.start());
 
 // Watchdog : toutes les 30s, si l'utilisateur veut le bot mais qu'il n'est ni connecté ni en cours de reconnexion → force
 setInterval(() => {
