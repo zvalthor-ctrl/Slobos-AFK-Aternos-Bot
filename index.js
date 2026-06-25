@@ -178,6 +178,11 @@ app.get('/', (req, res) => {
                 <dd>${config.server.ip}</dd>
                 <p class="stat-detail">Minecraft server hostname</p>
               </div>
+              <div class="stat-card">
+                <dt>Bots connectés</dt>
+                <dd id="bots-text">—</dd>
+                <p class="stat-detail" id="bots-detail">Liste des instances</p>
+              </div>
             </dl>
           </section>
 
@@ -189,6 +194,15 @@ app.get('/', (req, res) => {
             <div class="btn-grid btn-grid-2">
               <a href="/tutorial" class="btn-secondary" aria-label="View setup guide">Setup guide</a>
               <a href="/logs" class="btn-secondary" aria-label="View bot logs">View logs</a>
+            </div>
+            <div class="stat-card" style="margin-top:10px;">
+              <dt style="font-size:12px;color:#8b949e;font-weight:600;margin-bottom:8px;">Nombre de bots (redémarrage requis)</dt>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <input id="bot-count-input" type="number" min="1" max="10" value="${config["bot-count"] || 1}"
+                  style="width:70px;padding:8px 10px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;font-size:15px;font-weight:600;text-align:center;font-family:inherit;" />
+                <button onclick="setBotCount()" style="flex:1;min-height:38px;border-radius:8px;border:1px solid #388bfd;background:#0d2044;color:#79c0ff;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;">Sauvegarder</button>
+              </div>
+              <p id="bot-count-msg" style="margin:6px 0 0;font-size:11px;color:#6e7681;"></p>
             </div>
           </section>
 
@@ -236,6 +250,15 @@ app.get('/', (req, res) => {
               } else {
                 document.getElementById('coords-text').textContent = 'Searching…';
               }
+
+              // Bots multi
+              if (data.bots) {
+                document.getElementById('bots-text').textContent = data.connectedCount + ' / ' + data.botCount;
+                const details = data.bots.map(b =>
+                  (b.connected ? '🟢' : '🔴') + ' ' + b.username
+                ).join('  ');
+                document.getElementById('bots-detail').textContent = details;
+              }
             } catch (e) {
               const label = document.getElementById('status-label');
               label.className = 'status-label offline';
@@ -246,15 +269,28 @@ app.get('/', (req, res) => {
           async function startBot() {
             const r = await fetch('/start', { method: 'POST' });
             const data = await r.json();
-            alert(data.success ? 'Bot started!' : data.msg);
+            alert(data.success ? 'Bots démarrés !' : data.msg);
             update();
           }
 
           async function stopBot() {
             const r = await fetch('/stop', { method: 'POST' });
             const data = await r.json();
-            alert(data.success ? 'Bot stopped!' : data.msg);
+            alert(data.success ? 'Bots arrêtés !' : data.msg);
             update();
+          }
+
+          async function setBotCount() {
+            const count = parseInt(document.getElementById('bot-count-input').value, 10);
+            const r = await fetch('/set-bot-count', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ count })
+            });
+            const data = await r.json();
+            const msg = document.getElementById('bot-count-msg');
+            msg.textContent = data.msg;
+            msg.style.color = data.success ? '#3fb950' : '#f85149';
           }
 
           setInterval(update, 5000);
