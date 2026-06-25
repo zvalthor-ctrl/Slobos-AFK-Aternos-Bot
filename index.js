@@ -196,7 +196,7 @@ app.get('/', (req, res) => {
               <a href="/logs" class="btn-secondary" aria-label="View bot logs">View logs</a>
             </div>
             <div class="stat-card" style="margin-top:10px;">
-              <dt style="font-size:12px;color:#8b949e;font-weight:600;margin-bottom:8px;">Nombre de bots (redémarrage requis)</dt>
+              <dt style="font-size:12px;color:#8b949e;font-weight:600;margin-bottom:8px;">Nombre de bots</dt>
               <div style="display:flex;gap:8px;align-items:center;">
                 <input id="bot-count-input" type="number" min="1" max="10" value="${config["bot-count"] || 1}"
                   style="width:70px;padding:8px 10px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;font-size:15px;font-weight:600;text-align:center;font-family:inherit;" />
@@ -531,8 +531,10 @@ app.post("/set-bot-count", express.json(), (req, res) => {
     const cfg = JSON.parse(raw);
     cfg["bot-count"] = count;
     fs.writeFileSync("settings.json", JSON.stringify(cfg, null, 2));
-    addLog(`[Config] Nombre de bots changé → ${count}. Redémarrez l'application pour appliquer.`);
-    res.json({ success: true, msg: `Nombre de bots mis à jour : ${count}. Redémarrez pour appliquer.` });
+    // Apply immediately — no restart needed
+    applyBotCount(count);
+    addLog(`[Config] Nombre de bots changé → ${count} (appliqué immédiatement).`);
+    res.json({ success: true, msg: `${count} bot(s) actifs maintenant.` });
   } catch (e) {
     res.json({ success: false, msg: "Erreur lecture settings.json : " + e.message });
   }
@@ -1047,7 +1049,7 @@ app.post("/start", (req, res) => {
   botState.reconnectAttempts = 0;
   addLog(`[Control] Démarrage de ${TOTAL_BOTS} bot(s) — reconnexion automatique activée.`);
   createBot();
-  extraBots.forEach((b) => b.start());
+  extraBots.forEach((b) => b.start()); // redémarre les extra bots existants
 
   res.json({ success: true });
 });
@@ -1199,7 +1201,8 @@ setInterval(
 // ============================================================
 // MULTI-BOT EXTRA INSTANCES
 // ============================================================
-const TOTAL_BOTS = Math.max(1, Math.min(10, config["bot-count"] || 1));
+let activeBotCount = Math.max(1, Math.min(10, config["bot-count"] || 1));
+let TOTAL_BOTS = activeBotCount;
 
 function makeExtraBot(index) {
   const base = (config["bot-account"].username || "Bot").replace(/\d+$/, "");
@@ -1308,10 +1311,32 @@ function makeExtraBot(index) {
   };
 }
 
-// Créer les bots supplémentaires (index 1..N-1, le bot principal est l'index 0)
+// Bots supplémentaires — géré dynamiquement via applyBotCount()
 const extraBots = [];
-for (let i = 1; i < TOTAL_BOTS; i++) {
-  extraBots.push(makeExtraBot(i));
+
+function applyBotCount(n) {
+  n = Math.max(1, Math.min(10, n));
+  TOTAL_BOTS = n;
+  activeBotCount = n;
+  const target = n - 1; // extra bots needed (main bot is index 0)
+
+  if (extraBots.length < target) {
+    // Ajouter des bots manquants
+    for (let i = extraBots.length + 1; i <= target; i++) {
+      const mgr = makeExtraBot(i);
+      extraBots.push(mgr);
+      if (botRunning) mgr.start();
+      addLog(`[Multi-bot] Bot#${i} ajouté (${mgr.username})`);
+    }
+  } else if (extraBots.length > target) {
+    // Supprimer les bots en trop
+    while (extraBots.length > target) {
+      const mgr = extraBots.pop();
+      mgr.stop();
+      addLog(`[Multi-bot] Bot#${mgr.index} supprimé (${mgr.username})`);
+    }
+  }
+  addLog(`[Multi-bot] Nombre de bots actif : ${TOTAL_BOTS}`);
 }
 
 // ============================================================
@@ -2311,9 +2336,8 @@ addLog(
 );
 addLog("=".repeat(50));
 
-addLog(`[Multi-bot] ${TOTAL_BOTS} bot(s) configuré(s).`);
+applyBotCount(activeBotCount);
 createBot();
-extraBots.forEach((b) => b.start());
 
 // Watchdog : toutes les 30s, si l'utilisateur veut le bot mais qu'il n'est ni connecté ni en cours de reconnexion → force
 setInterval(() => {
