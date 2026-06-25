@@ -1302,18 +1302,119 @@ function makeExtraBot(index) {
           }, 10000 + index * 500);
         }
 
-        // Anti-AFK basique
-        const afkInterval = setInterval(() => {
-          if (!eBot || !connected) { clearInterval(afkInterval); return; }
-          try {
-            eBot.swingArm();
-            eBot.look(Math.random() * Math.PI * 2 - Math.PI, (Math.random() - 0.5) * Math.PI / 2, false);
-            if (Math.random() > 0.7 && typeof eBot.setControlState === "function") {
+        // ── Charger pathfinder (mêmes modules que le bot principal) ──
+        try { eBot.loadPlugin(pathfinder); } catch(e) {}
+        const eMcData = require("minecraft-data")(eBot.version);
+        const eMove = new Movements(eBot, eMcData);
+
+        // ── Circle walk aléatoire ──
+        if (config.movement && config.movement["circle-walk"] && config.movement["circle-walk"].enabled) {
+          const radius = config.movement["circle-walk"].radius || 4;
+          let originX = null, originZ = null, isPaused = false;
+
+          const doStep = () => {
+            const baseDelay = config.movement["circle-walk"].speed || 3000;
+            const delay = baseDelay * 0.5 + Math.floor(Math.random() * baseDelay * 2);
+            setTimeout(() => {
+              if (!eBot || !connected) { doStep(); return; }
+              if (!originX) { originX = eBot.entity.position.x; originZ = eBot.entity.position.z; }
+              if (isPaused) { doStep(); return; }
+              try {
+                const angle = Math.random() * Math.PI * 2;
+                const dist  = (0.4 + Math.random() * 0.6) * radius;
+                eBot.pathfinder.setMovements(eMove);
+                eBot.pathfinder.setGoal(new GoalBlock(
+                  Math.floor(originX + Math.cos(angle) * dist),
+                  Math.floor(eBot.entity.position.y),
+                  Math.floor(originZ + Math.sin(angle) * dist)
+                ));
+              } catch(e) {}
+              doStep();
+            }, delay);
+          };
+          doStep();
+
+          // Pauses aléatoires
+          const schedulePause = () => {
+            setTimeout(() => {
+              if (!eBot || !connected) { schedulePause(); return; }
+              isPaused = true;
+              try { eBot.pathfinder.setGoal(null); } catch(e) {}
+              const dur = 15000 + Math.floor(Math.random() * 45000);
+              setTimeout(() => { isPaused = false; schedulePause(); }, dur);
+            }, 120000 + Math.floor(Math.random() * 180000));
+          };
+          schedulePause();
+        }
+
+        // ── Sauts aléatoires ──
+        if (config.movement && config.movement["random-jump"] && config.movement["random-jump"].enabled) {
+          const schedJump = () => {
+            const base = config.movement["random-jump"].interval || 10000;
+            const delay = base * 0.5 + Math.floor(Math.random() * base * 1.5);
+            setTimeout(() => {
+              if (!eBot || !connected) { schedJump(); return; }
+              try {
+                eBot.setControlState("jump", true);
+                setTimeout(() => { if (eBot) try { eBot.setControlState("jump", false); } catch(e) {} }, 200 + Math.floor(Math.random() * 200));
+              } catch(e) {}
+              schedJump();
+            }, delay);
+          };
+          schedJump();
+        }
+
+        // ── Regard aléatoire ──
+        if (config.movement && config.movement["look-around"] && config.movement["look-around"].enabled) {
+          const schedLook = () => {
+            const base = config.movement["look-around"].interval || 5000;
+            const delay = base * 0.4 + Math.floor(Math.random() * base * 2.5);
+            setTimeout(() => {
+              if (!eBot || !connected) { schedLook(); return; }
+              try { eBot.look(Math.random() * Math.PI * 2 - Math.PI, (Math.random() - 0.5) * (Math.PI / 2), false); } catch(e) {}
+              schedLook();
+            }, delay);
+          };
+          schedLook();
+        }
+
+        // ── Lit la nuit ──
+        if (config.modules && config.modules.beds && config.beds && config.beds["place-night"]) {
+          let isTryingToSleep = false;
+          setInterval(async () => {
+            if (!eBot || !connected || isTryingToSleep) return;
+            try {
+              const isNight = eBot.time.timeOfDay >= 12500 && eBot.time.timeOfDay <= 23500;
+              if (isNight) {
+                const bed = eBot.findBlock({ matching: (b) => b.name.includes("bed"), maxDistance: 8 });
+                if (bed) {
+                  isTryingToSleep = true;
+                  try { await eBot.sleep(bed); addLog(`[Bot#${index}] Dort...`); }
+                  catch(e) {}
+                  finally { isTryingToSleep = false; }
+                }
+              }
+            } catch(e) { isTryingToSleep = false; }
+          }, 10000);
+        }
+
+        // ── Anti-AFK : bras + accroupi ──
+        setInterval(() => {
+          if (!eBot || !connected) return;
+          try { eBot.swingArm(); } catch(e) {}
+        }, 10000 + Math.floor(Math.random() * 50000));
+
+        setInterval(() => {
+          if (!eBot || !connected || typeof eBot.setControlState !== "function") return;
+          if (Math.random() > 0.8) {
+            try {
               eBot.setControlState("sneak", true);
               setTimeout(() => { try { if (eBot) eBot.setControlState("sneak", false); } catch(e) {} }, 1500 + Math.random() * 2000);
-            }
-          } catch(e) {}
-        }, 12000 + Math.floor(Math.random() * 18000));
+            } catch(e) {}
+          }
+        }, 20000 + Math.floor(Math.random() * 40000));
+
+        addLog(`[Bot#${index}] Modules actifs : walk, jump, regard, lit`);
       });
 
       eBot.on("end", () => { connected = false; schedRecon(); });
