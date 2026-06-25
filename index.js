@@ -1048,8 +1048,13 @@ app.post("/start", (req, res) => {
   isReconnecting = false;
   botState.reconnectAttempts = 0;
   addLog(`[Control] Démarrage de ${TOTAL_BOTS} bot(s) — reconnexion automatique activée.`);
-  createBot();
-  extraBots.forEach((b) => b.start()); // redémarre les extra bots existants
+  createBot(); // Bot#0 démarre immédiatement
+  // Échelonner les extra bots : +25s par bot pour éviter le throttle Aternos
+  extraBots.forEach((b, idx) => {
+    const delay = (idx + 1) * BOT_STAGGER_MS;
+    addLog(`[Multi-bot] ${b.username} démarrera dans ${delay / 1000}s`);
+    setTimeout(() => { if (botRunning) b.start(); }, delay);
+  });
 
   res.json({ success: true });
 });
@@ -1314,6 +1319,9 @@ function makeExtraBot(index) {
 // Bots supplémentaires — géré dynamiquement via applyBotCount()
 const extraBots = [];
 
+// Délai entre chaque connexion bot pour éviter le throttle serveur
+const BOT_STAGGER_MS = 25000; // 25s entre chaque bot
+
 function applyBotCount(n) {
   n = Math.max(1, Math.min(10, n));
   TOTAL_BOTS = n;
@@ -1325,8 +1333,13 @@ function applyBotCount(n) {
     for (let i = extraBots.length + 1; i <= target; i++) {
       const mgr = makeExtraBot(i);
       extraBots.push(mgr);
-      if (botRunning) mgr.start();
       addLog(`[Multi-bot] Bot#${i} ajouté (${mgr.username})`);
+      if (botRunning) {
+        // Échelonner chaque connexion pour éviter le throttle (index i = slot i)
+        const slotDelay = i * BOT_STAGGER_MS;
+        addLog(`[Multi-bot] Bot#${i} (${mgr.username}) démarrera dans ${slotDelay / 1000}s`);
+        setTimeout(() => { if (botRunning) mgr.start(); }, slotDelay);
+      }
     }
   } else if (extraBots.length > target) {
     // Supprimer les bots en trop
