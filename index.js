@@ -1267,13 +1267,39 @@ function makeExtraBot(index) {
         attempts = 0;
         addLog(`[Bot#${index}] ✓ Connecté en tant que ${username}`);
 
-        // Auto-auth
+        // Auto-auth : écouter les prompts du serveur (register OU login)
         if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
+          const pwd = config.utils["auto-auth"].password;
+          let authDone = false;
+
+          const tryAuth = (type) => {
+            if (authDone || !eBot || !connected) return;
+            authDone = true;
+            try {
+              if (type === "register") {
+                eBot.chat(`/register ${pwd} ${pwd}`);
+                addLog(`[Bot#${index}] Auth → /register`);
+              } else {
+                eBot.chat(`/login ${pwd}`);
+                addLog(`[Bot#${index}] Auth → /login`);
+              }
+            } catch(e) {}
+          };
+
+          eBot.on("messagestr", (msg) => {
+            if (authDone) return;
+            const m = msg.toLowerCase();
+            if (m.includes("/register") || m.includes("register ")) tryAuth("register");
+            else if (m.includes("/login") || m.includes("login ")) tryAuth("login");
+          });
+
+          // Failsafe : si pas de prompt après 10s, essayer /login
           setTimeout(() => {
-            if (eBot && connected) {
-              try { eBot.chat(`/login ${config.utils["auto-auth"].password}`); } catch(e) {}
+            if (!authDone && eBot && connected) {
+              addLog(`[Bot#${index}] Auth failsafe → /login`);
+              tryAuth("login");
             }
-          }, 10500 + index * 500);
+          }, 10000 + index * 500);
         }
 
         // Anti-AFK basique
@@ -1440,8 +1466,10 @@ function createBot() {
       config.server.version && config.server.version.trim() !== ""
         ? config.server.version
         : false;
+    // Normaliser le username : strip des chiffres finaux + index "00"
+    const BASE_USERNAME = (config["bot-account"].username || "Bot").replace(/\d+$/, "");
     bot = mineflayer.createBot({
-      username: config["bot-account"].username,
+      username: BASE_USERNAME + "00",
       password: config["bot-account"].password || undefined,
       auth: config["bot-account"].type,
       host: config.server.ip,
