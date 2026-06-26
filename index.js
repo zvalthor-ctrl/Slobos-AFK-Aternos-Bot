@@ -3,7 +3,7 @@
 const { addLog, getLogs } = require("./logger");
 const mineflayer = require("mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
-const { GoalBlock } = goals;
+const { GoalBlock, GoalNear } = goals;
 const config = require("./settings.json");
 const fs = require("fs");
 const express = require("express");
@@ -1424,33 +1424,37 @@ function makeBot(index) {
             if (!eBot || !connected || isTryingToSleep) return;
             try {
               if (!eBot.time) return;
-              const isNight = eBot.time.timeOfDay >= 12500 && eBot.time.timeOfDay <= 23500;
-              if (isNight) {
-                const bed = eBot.findBlock({
-                  matching: (b) => {
-                    if (!b.name.includes("bed")) return false;
-                    const k = `${b.position.x},${b.position.y},${b.position.z}`;
-                    return !occupiedBeds.has(k);
-                  },
-                  maxDistance: 8,
-                });
-                if (bed) {
-                  myBedKey = `${bed.position.x},${bed.position.y},${bed.position.z}`;
-                  occupiedBeds.add(myBedKey);
-                  isTryingToSleep = true;
-                  try { await eBot.sleep(bed); addLog(`[Bot#${index}] Dort...`); }
-                  catch(e) {}
-                  finally {
-                    isTryingToSleep = false;
-                    if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
-                  }
-                }
+              const tod = eBot.time.timeOfDay;
+              const isNight = tod >= 12541 && tod <= 23458;
+              if (!isNight) return;
+              const bed = eBot.findBlock({
+                matching: (b) => {
+                  if (!b.name.includes("bed")) return false;
+                  const k = `${b.position.x},${b.position.y},${b.position.z}`;
+                  return !occupiedBeds.has(k);
+                },
+                maxDistance: 50,
+              });
+              if (!bed) { addLog(`[Bot#${index}] Aucun lit trouvé (<50 blocs)`); return; }
+              myBedKey = `${bed.position.x},${bed.position.y},${bed.position.z}`;
+              occupiedBeds.add(myBedKey);
+              isTryingToSleep = true;
+              try {
+                // Se déplacer à côté du lit avant de dormir
+                await eBot.pathfinder.goto(new GoalNear(bed.position.x, bed.position.y, bed.position.z, 2));
+                await eBot.sleep(bed);
+                addLog(`[Bot#${index}] Dort dans le lit ${myBedKey}`);
+              } catch(e) {
+                addLog(`[Bot#${index}] Échec sommeil: ${e.message}`);
+              } finally {
+                isTryingToSleep = false;
+                if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
               }
             } catch(e) {
               isTryingToSleep = false;
               if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
             }
-          }, 10000);
+          }, 5000);
         }
 
         // ── Anti-AFK : regard aléatoire supplémentaire (remplace swingArm pour éviter le geste de cassage) ──
