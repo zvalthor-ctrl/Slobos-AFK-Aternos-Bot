@@ -1541,7 +1541,11 @@ function makeBot(index) {
           });
         }
 
-        addLog(`[Bot#${index}] Modules actifs : walk, jump, regard, lit, anti-afk, combat, chat`);
+        const activeModules = ["walk", "jump", "regard", "lit", "anti-afk"];
+        if (config.modules && config.modules.combat) activeModules.push("combat");
+        if (config.modules && config.modules.avoidMobs && !config.modules.combat) activeModules.push("avoidMobs");
+        if (config.modules && config.modules.chat) activeModules.push("chat");
+        addLog(`[Bot#${index}] Modules actifs : ${activeModules.join(", ")}`);
       });
 
       eBot.on("kicked", (reason) => {
