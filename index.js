@@ -1378,43 +1378,110 @@ function makeExtraBot(index) {
           schedLook();
         }
 
-        // ── Lit la nuit ──
+        // ── Lit la nuit (shared bed tracker) ──
         if (config.modules && config.modules.beds && config.beds && config.beds["place-night"]) {
           let isTryingToSleep = false;
+          let myBedKey = null;
           setInterval(async () => {
             if (!eBot || !connected || isTryingToSleep) return;
             try {
               const isNight = eBot.time.timeOfDay >= 12500 && eBot.time.timeOfDay <= 23500;
               if (isNight) {
-                const bed = eBot.findBlock({ matching: (b) => b.name.includes("bed"), maxDistance: 8 });
+                const bed = eBot.findBlock({
+                  matching: (b) => {
+                    if (!b.name.includes("bed")) return false;
+                    const k = `${b.position.x},${b.position.y},${b.position.z}`;
+                    return !occupiedBeds.has(k);
+                  },
+                  maxDistance: 8,
+                });
                 if (bed) {
+                  myBedKey = `${bed.position.x},${bed.position.y},${bed.position.z}`;
+                  occupiedBeds.add(myBedKey);
                   isTryingToSleep = true;
                   try { await eBot.sleep(bed); addLog(`[Bot#${index}] Dort...`); }
                   catch(e) {}
-                  finally { isTryingToSleep = false; }
+                  finally {
+                    isTryingToSleep = false;
+                    if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
+                  }
                 }
               }
-            } catch(e) { isTryingToSleep = false; }
+            } catch(e) {
+              isTryingToSleep = false;
+              if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
+            }
           }, 10000);
         }
 
-        // ── Anti-AFK : bras + accroupi ──
+        // ── Anti-AFK : bras ──
         setInterval(() => {
           if (!eBot || !connected) return;
           try { eBot.swingArm(); } catch(e) {}
         }, 10000 + Math.floor(Math.random() * 50000));
 
+        // ── Hotbar cycling ──
+        setInterval(() => {
+          if (!eBot || !connected) return;
+          try { eBot.setQuickBarSlot(Math.floor(Math.random() * 9)); } catch(e) {}
+        }, 30000 + Math.floor(Math.random() * 90000));
+
+        // ── Teabagging occasionnel ──
         setInterval(() => {
           if (!eBot || !connected || typeof eBot.setControlState !== "function") return;
-          if (Math.random() > 0.8) {
+          if (Math.random() > 0.9) {
+            let count = 2 + Math.floor(Math.random() * 3);
+            const doTeabag = () => {
+              if (count <= 0 || !eBot || typeof eBot.setControlState !== "function") return;
+              try {
+                eBot.setControlState("sneak", true);
+                setTimeout(() => {
+                  try { if (eBot) eBot.setControlState("sneak", false); } catch(e) {}
+                  count--;
+                  setTimeout(doTeabag, 150);
+                }, 150);
+              } catch(e) {}
+            };
+            doTeabag();
+          }
+        }, 120000 + Math.floor(Math.random() * 180000));
+
+        // ── Accroupi aléatoire ──
+        const scheduleExtraSneak = () => {
+          const delay = 45000 + Math.floor(Math.random() * 90000);
+          setTimeout(() => {
+            if (!eBot || !connected || typeof eBot.setControlState !== "function") {
+              scheduleExtraSneak(); return;
+            }
             try {
               eBot.setControlState("sneak", true);
-              setTimeout(() => { try { if (eBot) eBot.setControlState("sneak", false); } catch(e) {} }, 1500 + Math.random() * 2000);
-            } catch(e) {}
-          }
-        }, 20000 + Math.floor(Math.random() * 40000));
+              const dur = 2000 + Math.floor(Math.random() * 6000);
+              setTimeout(() => {
+                try { if (eBot) eBot.setControlState("sneak", false); } catch(e) {}
+                scheduleExtraSneak();
+              }, dur);
+            } catch(e) { scheduleExtraSneak(); }
+          }, delay);
+        };
+        scheduleExtraSneak();
 
-        addLog(`[Bot#${index}] Modules actifs : walk, jump, regard, lit`);
+        // ── Ouverture inventaire ──
+        const scheduleExtraInventory = () => {
+          const delay = 180000 + Math.floor(Math.random() * 300000);
+          setTimeout(() => {
+            if (!eBot || !connected) { scheduleExtraInventory(); return; }
+            try {
+              eBot.openInventory && eBot.openInventory();
+              setTimeout(() => {
+                try { if (eBot && eBot.currentWindow) eBot.closeWindow(eBot.currentWindow); } catch(e) {}
+                scheduleExtraInventory();
+              }, 2000 + Math.floor(Math.random() * 4000));
+            } catch(e) { scheduleExtraInventory(); }
+          }, delay);
+        };
+        scheduleExtraInventory();
+
+        addLog(`[Bot#${index}] Modules actifs : walk, jump, regard, lit, anti-afk complet`);
       });
 
       eBot.on("end", () => { connected = false; schedRecon(); });
@@ -2107,6 +2174,11 @@ function startLookAround(bot) {
 }
 
 // ============================================================
+// SHARED BED TRACKER - prevents multiple bots using the same bed
+// ============================================================
+const occupiedBeds = new Set(); // keys: "x,y,z"
+
+// ============================================================
 // CUSTOM MODULES
 // ============================================================
 
@@ -2223,25 +2295,32 @@ function combatModule(bot, mcData) {
 // Bed module
 // FIX: bot.isSleeping can be stale; use a local isTryingToSleep guard to prevent double-sleep errors
 // FIX: place-night was false in default settings - documentation note added
+// FIX: use occupiedBeds set so multiple bots never claim the same bed
 function bedModule(bot, mcData) {
   let isTryingToSleep = false;
+  let myBedKey = null;
 
   addInterval(async () => {
     if (!bot || !botState.connected) return;
-    if (!config.beds["place-night"]) return; // FIX: check flag (was always skipping before)
+    if (!config.beds["place-night"]) return;
 
     try {
       const isNight =
         bot.time.timeOfDay >= 12500 && bot.time.timeOfDay <= 23500;
 
-      // FIX: use local guard instead of stale bot.isSleeping
       if (isNight && !isTryingToSleep) {
         const bedBlock = bot.findBlock({
-          matching: (block) => block.name.includes("bed"),
+          matching: (block) => {
+            if (!block.name.includes("bed")) return false;
+            const k = `${block.position.x},${block.position.y},${block.position.z}`;
+            return !occupiedBeds.has(k);
+          },
           maxDistance: 8,
         });
 
         if (bedBlock) {
+          myBedKey = `${bedBlock.position.x},${bedBlock.position.y},${bedBlock.position.z}`;
+          occupiedBeds.add(myBedKey);
           isTryingToSleep = true;
           try {
             await bot.sleep(bedBlock);
@@ -2250,11 +2329,13 @@ function bedModule(bot, mcData) {
             // Can't sleep - maybe not night enough or monsters nearby
           } finally {
             isTryingToSleep = false;
+            if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
           }
         }
       }
     } catch (e) {
       isTryingToSleep = false;
+      if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
       addLog("[Bed] Error:", e.message);
     }
   }, 10000);
