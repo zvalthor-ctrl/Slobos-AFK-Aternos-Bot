@@ -1385,6 +1385,7 @@ function makeExtraBot(index) {
           setInterval(async () => {
             if (!eBot || !connected || isTryingToSleep) return;
             try {
+              if (!eBot.time) return;
               const isNight = eBot.time.timeOfDay >= 12500 && eBot.time.timeOfDay <= 23500;
               if (isNight) {
                 const bed = eBot.findBlock({
@@ -2305,6 +2306,7 @@ function bedModule(bot, mcData) {
     if (!config.beds["place-night"]) return;
 
     try {
+      if (!bot.time) return;
       const isNight =
         bot.time.timeOfDay >= 12500 && bot.time.timeOfDay <= 23500;
 
@@ -2336,7 +2338,7 @@ function bedModule(bot, mcData) {
     } catch (e) {
       isTryingToSleep = false;
       if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
-      addLog("[Bed] Error:", e.message);
+      if (e.message) addLog("[Bed] Error: " + e.message);
     }
   }, 10000);
 }
