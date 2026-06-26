@@ -5,7 +5,18 @@ const mineflayer = require("mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
 const { GoalBlock } = goals;
 const config = require("./settings.json");
+const fs = require("fs");
 const express = require("express");
+
+// ── Position mémoire : persistée entre les connexions dans bot-positions.json ──
+let botPositions = {};
+try {
+  botPositions = JSON.parse(fs.readFileSync("bot-positions.json", "utf8"));
+} catch(e) {}
+
+function saveBotPositions() {
+  try { fs.writeFileSync("bot-positions.json", JSON.stringify(botPositions, null, 2)); } catch(e) {}
+}
 const http = require("http");
 const https = require("https");
 
@@ -1308,17 +1319,43 @@ function makeBot(index) {
         eMove.liquidCost = 1000;
         eMove.fallDamageCost = 1000;
 
+        // ── Origine de marche — initialisée depuis la mémoire ou la position de spawn ──
+        const _saved = botPositions[index];
+        let originX = _saved ? _saved.x : null;
+        let originZ = _saved ? _saved.z : null;
+
+        // Retourner à la position sauvegardée si trop loin au spawn
+        if (_saved && eBot.entity) {
+          const _sp = eBot.entity.position;
+          const _d = Math.sqrt(Math.pow(_sp.x - _saved.x, 2) + Math.pow(_sp.z - _saved.z, 2));
+          if (_d > 5) {
+            addLog(`[Bot#${index}] Retour position sauvegardée (${_d.toFixed(0)} blocs)...`);
+            try { eBot.pathfinder.setMovements(eMove); eBot.pathfinder.setGoal(new GoalBlock(_saved.x, _saved.y, _saved.z)); } catch(e) {}
+          }
+        }
+
+        // ── Mémorisation des /tp (forcedMove) ──
+        eBot.on("forcedMove", () => {
+          if (!connected || !eBot.entity) return;
+          const p = eBot.entity.position;
+          originX = Math.floor(p.x);
+          originZ = Math.floor(p.z);
+          botPositions[index] = { x: originX, y: Math.floor(p.y), z: originZ };
+          saveBotPositions();
+          addLog(`[Bot#${index}] 📍 /tp sauvegardé → X=${originX} Y=${Math.floor(p.y)} Z=${originZ}`);
+        });
+
         // ── Circle walk aléatoire ──
         if (config.movement && config.movement["circle-walk"] && config.movement["circle-walk"].enabled) {
           const radius = config.movement["circle-walk"].radius || 4;
-          let originX = null, originZ = null, isPaused = false;
+          let isPaused = false;
 
           const doStep = () => {
             const baseDelay = config.movement["circle-walk"].speed || 3000;
             const delay = baseDelay * 0.5 + Math.floor(Math.random() * baseDelay * 2);
             setTimeout(() => {
               if (!eBot || !connected) { doStep(); return; }
-              if (!originX) { originX = eBot.entity.position.x; originZ = eBot.entity.position.z; }
+              if (originX === null) { originX = eBot.entity.position.x; originZ = eBot.entity.position.z; }
               if (isPaused) { doStep(); return; }
               try {
                 const angle = Math.random() * Math.PI * 2;
@@ -1541,7 +1578,8 @@ function makeBot(index) {
           });
         }
 
-        const activeModules = ["walk", "jump", "regard", "lit", "anti-afk"];
+        const activeModules = ["walk", "regard", "lit", "anti-afk"];
+        if (config.movement && config.movement["random-jump"] && config.movement["random-jump"].enabled) activeModules.push("saut");
         if (config.modules && config.modules.combat) activeModules.push("combat");
         if (config.modules && config.modules.avoidMobs && !config.modules.combat) activeModules.push("avoidMobs");
         if (config.modules && config.modules.chat) activeModules.push("chat");
