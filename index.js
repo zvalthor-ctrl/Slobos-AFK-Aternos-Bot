@@ -1463,6 +1463,17 @@ function makeBot(index) {
         eBot.dig = () => Promise.reject(new Error("dig disabled"));
         eBot._dig  = () => {};
 
+        // ── Pas de ramassage d'objets ──
+        eBot.on("playerCollect", (collector) => {
+          if (!eBot || collector !== eBot.entity) return;
+          setTimeout(() => {
+            if (!eBot || !connected) return;
+            eBot.inventory.items().forEach(item => {
+              try { eBot.tossStack(item); } catch(e) {}
+            });
+          }, 200);
+        });
+
         // ── Hotbar cycling ──
         setInterval(() => {
           if (!eBot || !connected) return;
