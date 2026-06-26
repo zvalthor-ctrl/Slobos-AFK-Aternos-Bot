@@ -1453,11 +1453,15 @@ function makeBot(index) {
           }, 10000);
         }
 
-        // ── Anti-AFK : bras ──
+        // ── Anti-AFK : regard aléatoire supplémentaire (remplace swingArm pour éviter le geste de cassage) ──
         setInterval(() => {
           if (!eBot || !connected) return;
-          try { eBot.swingArm(); } catch(e) {}
-        }, 10000 + Math.floor(Math.random() * 50000));
+          try { eBot.look(Math.random() * Math.PI * 2 - Math.PI, (Math.random() - 0.3) * (Math.PI / 3), false); } catch(e) {}
+        }, 15000 + Math.floor(Math.random() * 45000));
+
+        // ── Verrou absolu anti-cassage ──
+        eBot.dig = () => Promise.reject(new Error("dig disabled"));
+        eBot._dig  = () => {};
 
         // ── Hotbar cycling ──
         setInterval(() => {
