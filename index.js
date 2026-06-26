@@ -500,23 +500,16 @@ app.get("/tutorial", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  const mainConnected = botState.connected;
-  const extraConnected = extraBots.filter((b) => b.isConnected()).length;
-  const totalConnected = (mainConnected ? 1 : 0) + extraConnected;
-  const baseName = (config["bot-account"].username || "Bot").replace(/\d+$/, "");
   res.json({
-    status: mainConnected ? "connected" : "disconnected",
+    status: botState.connected ? "connected" : "disconnected",
     uptime: Math.floor((Date.now() - botState.startTime) / 1000),
     coords: bot && bot.entity ? bot.entity.position : null,
     lastActivity: botState.lastActivity,
     reconnectAttempts: botState.reconnectAttempts,
     memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024,
     botCount: TOTAL_BOTS,
-    connectedCount: totalConnected,
-    bots: [
-      { index: 0, username: baseName + "00", connected: mainConnected },
-      ...extraBots.map((b) => ({ index: b.index, username: b.username, connected: b.isConnected() })),
-    ],
+    connectedCount: allBots.filter(b => b.isConnected()).length,
+    bots: allBots.map(b => ({ index: b.index, username: b.username, connected: b.isConnected() })),
   });
 });
 
@@ -1045,13 +1038,10 @@ app.post("/start", (req, res) => {
   if (botRunning) return res.json({ success: false, msg: "Already running" });
 
   botRunning = true;
-  isReconnecting = false;
-  botState.reconnectAttempts = 0;
   addLog(`[Control] Démarrage de ${TOTAL_BOTS} bot(s) — reconnexion automatique activée.`);
-  createBot(); // Bot#0 démarre immédiatement
-  // Échelonner les extra bots : +25s par bot pour éviter le throttle Aternos
-  extraBots.forEach((b, idx) => {
-    const delay = (idx + 1) * BOT_STAGGER_MS;
+  allBots.forEach((b, idx) => {
+    const delay = idx * BOT_STAGGER_MS;
+    if (delay === 0) { b.start(); return; }
     addLog(`[Multi-bot] ${b.username} démarrera dans ${delay / 1000}s`);
     setTimeout(() => { if (botRunning) b.start(); }, delay);
   });
@@ -1063,18 +1053,7 @@ app.post("/stop", (req, res) => {
   if (!botRunning) return res.json({ success: false, msg: "Already stopped" });
 
   botRunning = false;
-  isReconnecting = false;
-  clearBotTimeouts();
-
-  if (bot) {
-    try { bot.removeAllListeners(); bot.end(); } catch(e) {}
-    bot = null;
-  }
-
-  clearAllIntervals();
-  botState.connected = false;
-  botState.reconnectAttempts = 0;
-  extraBots.forEach((b) => b.stop());
+  allBots.forEach(b => b.stop());
   addLog(`[Control] ${TOTAL_BOTS} bot(s) arrêtés — reconnexion automatique désactivée.`);
 
   res.json({ success: true });
@@ -1209,7 +1188,7 @@ setInterval(
 let activeBotCount = Math.max(1, Math.min(10, config["bot-count"] || 1));
 let TOTAL_BOTS = activeBotCount;
 
-function makeExtraBot(index) {
+function makeBot(index) {
   const base = (config["bot-account"].username || "Bot").replace(/\d+$/, "");
   const username = base + String(index).padStart(2, "0");
   let eBot = null;
@@ -1218,6 +1197,7 @@ function makeExtraBot(index) {
   let reconTimer = null;
   let attempts = 0;
   let running = false;
+  let wasThrottled = false;
 
   function cleanup() {
     if (eBot) {
@@ -1225,14 +1205,25 @@ function makeExtraBot(index) {
       eBot = null;
     }
     connected = false;
+    if (index === 0) { botState.connected = false; bot = null; }
   }
 
   function schedRecon() {
     if (!running || isRecon) return;
     isRecon = true;
     attempts++;
-    const delay = Math.min(2000 * Math.pow(2, attempts - 1), 30000) + Math.floor(Math.random() * 2000);
-    addLog(`[Bot#${index}] Reconnecting in ${(delay / 1000).toFixed(1)}s (attempt #${attempts})`);
+    let delay;
+    if (wasThrottled) {
+      wasThrottled = false;
+      delay = 60000 + Math.floor(Math.random() * 60000);
+      addLog(`[Bot#${index}] Throttle détecté — délai étendu: ${(delay / 1000).toFixed(0)}s`);
+    } else {
+      const base = config.utils["auto-reconnect-delay"] || 2000;
+      const max  = config.utils["max-reconnect-delay"]  || 30000;
+      delay = Math.min(base * Math.pow(2, attempts - 1), max) + Math.floor(Math.random() * 2000);
+    }
+    addLog(`[Bot#${index}] Reconnexion dans ${(delay / 1000).toFixed(1)}s (tentative #${attempts})`);
+    if (index === 0) botState.reconnectAttempts = attempts;
     reconTimer = setTimeout(() => {
       isRecon = false;
       reconTimer = null;
@@ -1265,7 +1256,13 @@ function makeExtraBot(index) {
         clearTimeout(spawnTimeout);
         connected = true;
         attempts = 0;
-        addLog(`[Bot#${index}] ✓ Connecté en tant que ${username}`);
+        if (index === 0) {
+          bot = eBot;
+          botState.connected = true;
+          botState.lastActivity = Date.now();
+          botState.reconnectAttempts = 0;
+        }
+        addLog(`[Bot#${index}] ✓ Connecté en tant que ${username} (v${eBot.version})`);
 
         // Auto-auth : écouter les prompts du serveur (register OU login)
         if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
@@ -1486,11 +1483,88 @@ function makeExtraBot(index) {
         };
         scheduleExtraInventory();
 
-        addLog(`[Bot#${index}] Modules actifs : walk, jump, regard, lit, anti-afk complet`);
+        // ── Combat ──
+        if (config.modules && config.modules.combat) {
+          let lastAttackTime = 0;
+          let lockedTarget = null, lockedTargetExpiry = 0;
+          eBot.on("physicsTick", () => {
+            if (!eBot || !connected || !config.combat["attack-mobs"]) return;
+            const now = Date.now();
+            if (now - lastAttackTime < 620) return;
+            try {
+              if (lockedTarget && now < lockedTargetExpiry && eBot.entities[lockedTarget.id] && lockedTarget.position) {
+                if (eBot.entity.position.distanceTo(lockedTarget.position) < 4) {
+                  eBot.attack(lockedTarget); lastAttackTime = now; return;
+                } else { lockedTarget = null; }
+              }
+              const mobs = Object.values(eBot.entities).filter(e => e.type === "mob" && e.position && eBot.entity.position.distanceTo(e.position) < 4);
+              if (mobs.length > 0) { lockedTarget = mobs[0]; lockedTargetExpiry = now + 3000; eBot.attack(lockedTarget); lastAttackTime = now; }
+            } catch(e) {}
+          });
+          if (config.combat["auto-eat"]) {
+            eBot.on("health", () => {
+              try {
+                if (eBot.food < 14) {
+                  const food = eBot.inventory.items().find(i => i.foodPoints && i.foodPoints > 0);
+                  if (food) eBot.equip(food, "hand").then(() => eBot.consume()).catch(() => {});
+                }
+              } catch(e) {}
+            });
+          }
+        } else if (config.modules && config.modules.avoidMobs) {
+          // ── Évitement des mobs ──
+          setInterval(() => {
+            if (!eBot || !connected || typeof eBot.setControlState !== "function") return;
+            try {
+              const entities = Object.values(eBot.entities).filter(e => e.type === "mob" || (e.type === "player" && e.username !== eBot.username));
+              for (const e of entities) {
+                if (!e.position) continue;
+                if (eBot.entity.position.distanceTo(e.position) < 5) {
+                  eBot.setControlState("back", true);
+                  setTimeout(() => { try { if (eBot) eBot.setControlState("back", false); } catch(e) {} }, 500);
+                  break;
+                }
+              }
+            } catch(e) {}
+          }, 2000);
+        }
+
+        // ── Chat → Discord ──
+        if (config.modules && config.modules.chat) {
+          eBot.on("chat", (chatUser, message) => {
+            if (!eBot || chatUser === eBot.username) return;
+            try {
+              if (config.discord && config.discord.enabled && config.discord.events && config.discord.events.chat) {
+                sendDiscordWebhook(`💬 **${chatUser}**: ${message}`, 0x7289da);
+              }
+            } catch(e) {}
+          });
+        }
+
+        addLog(`[Bot#${index}] Modules actifs : walk, jump, regard, lit, anti-afk, combat, chat`);
       });
 
-      eBot.on("end", () => { connected = false; schedRecon(); });
-      eBot.on("error", () => { schedRecon(); });
+      eBot.on("kicked", (reason) => {
+        const r = typeof reason === "object" ? JSON.stringify(reason) : String(reason || "");
+        addLog(`[Bot#${index}] Expulsé: ${r}`);
+        const rLow = r.toLowerCase();
+        if (rLow.includes("throttl") || rLow.includes("wait before reconnect") || rLow.includes("too fast")) {
+          wasThrottled = true;
+        }
+        if (config.discord && config.discord.events && config.discord.events.disconnect) {
+          sendDiscordWebhook(`[!] **Kicked** \`${username}\`: ${r}`, 0xff0000);
+        }
+      });
+
+      eBot.on("end", () => {
+        connected = false;
+        if (index === 0) { botState.connected = false; bot = null; }
+        if (config.discord && config.discord.events && config.discord.events.disconnect) {
+          sendDiscordWebhook(`[-] **Disconnected**: \`${username}\``, 0xf87171);
+        }
+        schedRecon();
+      });
+      eBot.on("error", (err) => { addLog(`[Bot#${index}] Erreur: ${err.message || err}`); schedRecon(); });
     } catch(e) {
       addLog(`[Bot#${index}] Erreur: ${e.message}`);
       schedRecon();
@@ -1515,8 +1589,8 @@ function makeExtraBot(index) {
   };
 }
 
-// Bots supplémentaires — géré dynamiquement via applyBotCount()
-const extraBots = [];
+// Tous les bots gérés dynamiquement via applyBotCount() — index 0 = Louis00
+const allBots = [];
 
 // Délai entre chaque connexion bot pour éviter le throttle serveur
 const BOT_STAGGER_MS = 25000; // 25s entre chaque bot
@@ -1525,852 +1599,42 @@ function applyBotCount(n) {
   n = Math.max(1, Math.min(10, n));
   TOTAL_BOTS = n;
   activeBotCount = n;
-  const target = n - 1; // extra bots needed (main bot is index 0)
 
-  if (extraBots.length < target) {
-    // Ajouter des bots manquants
-    for (let i = extraBots.length + 1; i <= target; i++) {
-      const mgr = makeExtraBot(i);
-      extraBots.push(mgr);
-      addLog(`[Multi-bot] Bot#${i} ajouté (${mgr.username})`);
-      if (botRunning) {
-        // Échelonner chaque connexion pour éviter le throttle (index i = slot i)
-        const slotDelay = i * BOT_STAGGER_MS;
+  // Créer les bots manquants (index 0 inclus — tous passent par makeBot)
+  while (allBots.length < n) {
+    const i = allBots.length;
+    const mgr = makeBot(i);
+    allBots.push(mgr);
+    addLog(`[Multi-bot] Bot#${i} ajouté (${mgr.username})`);
+    if (botRunning) {
+      const slotDelay = i * BOT_STAGGER_MS;
+      if (slotDelay === 0) {
+        mgr.start();
+      } else {
         addLog(`[Multi-bot] Bot#${i} (${mgr.username}) démarrera dans ${slotDelay / 1000}s`);
         setTimeout(() => { if (botRunning) mgr.start(); }, slotDelay);
       }
     }
-  } else if (extraBots.length > target) {
-    // Supprimer les bots en trop
-    while (extraBots.length > target) {
-      const mgr = extraBots.pop();
-      mgr.stop();
-      addLog(`[Multi-bot] Bot#${mgr.index} supprimé (${mgr.username})`);
-    }
   }
+
+  // Supprimer les bots en trop
+  while (allBots.length > n) {
+    const mgr = allBots.pop();
+    mgr.stop();
+    addLog(`[Multi-bot] Bot#${mgr.index} supprimé (${mgr.username})`);
+  }
+
   addLog(`[Multi-bot] Nombre de bots actif : ${TOTAL_BOTS}`);
 }
 
-// ============================================================
-// BOT CREATION WITH RECONNECTION LOGIC
-// ============================================================
-// ============================================================
-// RECONNECTION & TIMEOUT MANAGEMENT
-// ============================================================
 let bot = null;
-let activeIntervals = [];
-let reconnectTimeoutId = null;
-let connectionTimeoutId = null;
-let isReconnecting = false;
-
-function clearBotTimeouts() {
-  if (reconnectTimeoutId) {
-    clearTimeout(reconnectTimeoutId);
-    reconnectTimeoutId = null;
-  }
-  if (connectionTimeoutId) {
-    clearTimeout(connectionTimeoutId);
-    connectionTimeoutId = null;
-  }
-}
-
-// FIX: Discord rate limiting - track last send time
 let lastDiscordSend = 0;
-const DISCORD_RATE_LIMIT_MS = 5000; // min 5s between webhook calls
-
-function clearAllIntervals() {
-  addLog(`[Cleanup] Clearing ${activeIntervals.length} intervals`);
-  activeIntervals.forEach((id) => clearInterval(id));
-  activeIntervals = [];
-}
-
-function addInterval(callback, delay) {
-  const id = setInterval(callback, delay);
-  activeIntervals.push(id);
-  return id;
-}
-
-function getReconnectDelay() {
-  if (botState.wasThrottled) {
-    botState.wasThrottled = false;
-    const throttleDelay = 60000 + Math.floor(Math.random() * 60000);
-    addLog(
-      `[Bot] Throttle detected - using extended delay: ${throttleDelay / 1000}s`,
-    );
-    return throttleDelay;
-  }
-
-  // FIX: read auto-reconnect-delay from settings as base delay
-  const baseDelay = config.utils["auto-reconnect-delay"] || 3000;
-  const maxDelay = config.utils["max-reconnect-delay"] || 30000;
-  const delay = Math.min(
-    baseDelay * Math.pow(2, botState.reconnectAttempts),
-    maxDelay,
-  );
-  const jitter = Math.floor(Math.random() * 2000);
-  return delay + jitter;
-}
-
-function createBot() {
-  if (isReconnecting) {
-    addLog("[Bot] Already reconnecting, skipping...");
-    return;
-  }
-
-  // Cleanup previous bot properly to avoid ghost bots
-  if (bot) {
-    clearAllIntervals();
-    try {
-      bot.removeAllListeners();
-      bot.end();
-    } catch (e) {
-      addLog("[Cleanup] Error ending previous bot:", e.message);
-    }
-    bot = null;
-  }
-
-  addLog(`[Bot] Creating bot instance...`);
-  addLog(`[Bot] Connecting to ${config.server.ip}:${config.server.port}`);
-
-  try {
-    // FIX: use version:false to auto-detect server version so the bot can join any server.
-    // If the user explicitly sets a version in settings.json it is still respected.
-    const botVersion =
-      config.server.version && config.server.version.trim() !== ""
-        ? config.server.version
-        : false;
-    // Normaliser le username : strip des chiffres finaux + index "00"
-    const BASE_USERNAME = (config["bot-account"].username || "Bot").replace(/\d+$/, "");
-    bot = mineflayer.createBot({
-      username: BASE_USERNAME + "00",
-      password: config["bot-account"].password || undefined,
-      auth: config["bot-account"].type,
-      host: config.server.ip,
-      port: config.server.port,
-      version: botVersion,
-      hideErrors: false,
-      checkTimeoutInterval: 600000,
-    });
-
-    bot.loadPlugin(pathfinder);
-
-    // FIX: connection timeout - end the old bot before reconnecting to avoid ghost bots
-    clearBotTimeouts();
-    connectionTimeoutId = setTimeout(() => {
-      if (!botState.connected) {
-        addLog("[Bot] Connection timeout - no spawn received");
-        try {
-          bot.removeAllListeners();
-          bot.end();
-        } catch (e) {
-          /* ignore */
-        }
-        bot = null;
-        scheduleReconnect();
-      }
-    }, 150000); // 150s - Aternos servers can take 90-120s to finish spawning a player
-
-    // FIX: guard against spawn firing twice (can happen on some servers)
-    let spawnHandled = false;
-
-    bot.once("spawn", () => {
-      if (spawnHandled) return;
-      spawnHandled = true;
-
-      clearBotTimeouts();
-      botState.connected = true;
-      botState.lastActivity = Date.now();
-      botState.reconnectAttempts = 0;
-      isReconnecting = false;
-
-      addLog(
-        `[Bot] [+] Successfully spawned on server! (Version: ${bot.version})`,
-      );
-      if (
-        config.discord &&
-        config.discord.events &&
-        config.discord.events.connect
-      ) {
-        sendDiscordWebhook(
-          `[+] **Connected** to \`${config.server.ip}\``,
-          0x4ade80,
-        );
-      }
-
-      // FIX: use bot.version (auto-detected) instead of config value so minecraft-data always matches
-      const mcData = require("minecraft-data")(bot.version);
-      const defaultMove = new Movements(bot, mcData);
-      defaultMove.allowFreeMotion = false;
-      defaultMove.canDig = false;
-      defaultMove.liquidCost = 1000;
-      defaultMove.fallDamageCost = 1000;
-
-      initializeModules(bot, mcData, defaultMove);
-
-      // Attempt creative mode (only works if bot has OP and enabled in settings)
-      setTimeout(() => {
-        if (bot && botState.connected && config.server["try-creative"]) {
-          bot.chat("/gamemode creative");
-          addLog("[INFO] Attempted to set creative mode (requires OP)");
-        }
-      }, 3000);
-
-      bot.on("messagestr", (message) => {
-        if (
-          message.includes("commands.gamemode.success.self") ||
-          message.includes("Set own game mode to Creative Mode")
-        ) {
-          addLog("[INFO] Bot is now in Creative Mode.");
-        }
-      });
-    });
-
-    // FIX: 'kicked' fires before 'end'. Remove the scheduleReconnect from 'kicked'
-    // so that 'end' is the single source of reconnect truth, preventing double-trigger.
-    bot.on("kicked", (reason) => {
-      // FIX: stringify reason if it's an object to make it readable in logs
-      const kickReason =
-        typeof reason === "object" ? JSON.stringify(reason) : reason;
-      addLog(`[Bot] Kicked: ${kickReason}`);
-      botState.connected = false;
-      botState.errors.push({
-        type: "kicked",
-        reason: kickReason,
-        time: Date.now(),
-      });
-      clearAllIntervals();
-
-      const reasonStr = String(kickReason).toLowerCase();
-      if (
-        reasonStr.includes("throttl") ||
-        reasonStr.includes("wait before reconnect") ||
-        reasonStr.includes("too fast")
-      ) {
-        addLog(
-          "[Bot] Throttle kick detected - will use extended reconnect delay",
-        );
-        botState.wasThrottled = true;
-      }
-
-      if (
-        config.discord &&
-        config.discord.events &&
-        config.discord.events.disconnect
-      ) {
-        sendDiscordWebhook(`[!] **Kicked**: ${kickReason}`, 0xff0000);
-      }
-      // NOTE: do NOT call scheduleReconnect() here - 'end' will fire right after 'kicked' and handle it
-    });
-
-    // FIX: 'end' is the single reconnect trigger
-    bot.on("end", (reason) => {
-      addLog(`[Bot] Disconnected: ${reason || "Unknown reason"}`);
-      botState.connected = false;
-      clearAllIntervals();
-      spawnHandled = false; // reset for next connection
-
-      if (
-        config.discord &&
-        config.discord.events &&
-        config.discord.events.disconnect
-      ) {
-        sendDiscordWebhook(
-          `[-] **Disconnected**: ${reason || "Unknown"}`,
-          0xf87171,
-        );
-      }
-
-      // ALWAYS reconnect — bot must never leave the server
-      scheduleReconnect();
-    });
-
-    bot.on("error", (err) => {
-      const msg = err.message || "";
-      addLog(`[Bot] Error: ${msg}`);
-      botState.errors.push({ type: "error", message: msg, time: Date.now() });
-      // Trigger reconnect here too — 'end' doesn't always fire after 'error'
-      // scheduleReconnect() is safe to call here: its isReconnecting guard prevents double-scheduling
-      scheduleReconnect();
-    });
-  } catch (err) {
-    addLog(`[Bot] Failed to create bot: ${err.message}`);
-    scheduleReconnect();
-  }
-}
-
-function scheduleReconnect() {
-  // Ne jamais reconnecter si l'utilisateur a cliqué sur Stop
-  if (!botRunning) {
-    addLog("[Bot] Reconnect skipped — bot stopped by user.");
-    return;
-  }
-
-  clearBotTimeouts();
-
-  // FIX: don't stack reconnect if already waiting
-  if (isReconnecting) {
-    addLog("[Bot] Reconnect already scheduled, skipping duplicate.");
-    return;
-  }
-
-  isReconnecting = true;
-  botState.reconnectAttempts++;
-
-  const delay = getReconnectDelay();
-  addLog(
-    `[Bot] Reconnecting in ${(delay / 1000).toFixed(1)}s (attempt #${botState.reconnectAttempts})`,
-  );
-
-  reconnectTimeoutId = setTimeout(() => {
-    reconnectTimeoutId = null;
-    isReconnecting = false;
-    if (botRunning) createBot();
-  }, delay);
-}
-
-// ============================================================
-// MODULE INITIALIZATION
-// ============================================================
-function initializeModules(bot, mcData, defaultMove) {
-  addLog("[Modules] Initializing all modules...");
-
-  // ---------- AUTO AUTH (REACTIVE) ----------
-  if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
-    const password = config.utils["auto-auth"].password;
-    let authHandled = false;
-
-    const tryAuth = (type) => {
-      if (authHandled || !bot || !botState.connected) return;
-      authHandled = true;
-      if (type === "register") {
-        bot.chat(`/register ${password} ${password}`);
-        addLog("[Auth] Detected register prompt - sent /register");
-      } else {
-        bot.chat(`/login ${password}`);
-        addLog("[Auth] Detected login prompt - sent /login");
-      }
-    };
-
-    bot.on("messagestr", (message) => {
-      if (authHandled) return;
-      const msg = message.toLowerCase();
-      if (
-        msg.includes("/register") ||
-        msg.includes("register ") ||
-        msg.includes("지정된 비밀번호")
-      ) {
-        tryAuth("register");
-      } else if (
-        msg.includes("/login") ||
-        msg.includes("login ") ||
-        msg.includes("로그인")
-      ) {
-        tryAuth("login");
-      }
-    });
-
-    // Failsafe: if no prompt after 10s, try login anyway
-    setTimeout(() => {
-      if (!authHandled && bot && botState.connected) {
-        addLog(
-          "[Auth] No prompt detected after 10s, sending /login as failsafe",
-        );
-        bot.chat(`/login ${password}`);
-        authHandled = true;
-      }
-    }, 10000);
-  }
-
-  // ---------- CHAT MESSAGES (DISABLED - bot ne doit pas envoyer de messages dans le tchat) ----------
-  // if (config.utils["chat-messages"] && config.utils["chat-messages"].enabled) { ... }
-
-  // ---------- MOVE TO POSITION ----------
-  // FIX: only use position goal if circle-walk is NOT enabled (they fight over pathfinder)
-  if (
-    config.position &&
-    config.position.enabled &&
-    !(
-      config.movement &&
-      config.movement["circle-walk"] &&
-      config.movement["circle-walk"].enabled
-    )
-  ) {
-    bot.pathfinder.setMovements(defaultMove);
-    bot.pathfinder.setGoal(
-      new GoalBlock(config.position.x, config.position.y, config.position.z),
-    );
-    addLog("[Position] Navigating to configured position...");
-  }
-
-  // ---------- ANTI-AFK ----------
-  if (config.utils["anti-afk"] && config.utils["anti-afk"].enabled) {
-    // Arm swinging
-    addInterval(
-      () => {
-        if (!bot || !botState.connected) return;
-        try {
-          bot.swingArm();
-        } catch (e) {}
-      },
-      10000 + Math.floor(Math.random() * 50000),
-    );
-
-    // Hotbar cycling
-    addInterval(
-      () => {
-        if (!bot || !botState.connected) return;
-        try {
-          const slot = Math.floor(Math.random() * 9);
-          bot.setQuickBarSlot(slot);
-        } catch (e) {}
-      },
-      30000 + Math.floor(Math.random() * 90000),
-    );
-
-    // Teabagging
-    addInterval(
-      () => {
-        if (
-          !bot ||
-          !botState.connected ||
-          typeof bot.setControlState !== "function"
-        )
-          return;
-        if (Math.random() > 0.9) {
-          let count = 2 + Math.floor(Math.random() * 4);
-          const doTeabag = () => {
-            if (count <= 0 || !bot || typeof bot.setControlState !== "function")
-              return;
-            try {
-              bot.setControlState("sneak", true);
-              setTimeout(() => {
-                if (bot && typeof bot.setControlState === "function")
-                  bot.setControlState("sneak", false);
-                count--;
-                setTimeout(doTeabag, 150);
-              }, 150);
-            } catch (e) {}
-          };
-          doTeabag();
-        }
-      },
-      120000 + Math.floor(Math.random() * 180000),
-    );
-
-    // FIX: micro-walk only when circle-walk is NOT running, to avoid interrupting pathfinder
-    if (
-      !(
-        config.movement &&
-        config.movement["circle-walk"] &&
-        config.movement["circle-walk"].enabled
-      )
-    ) {
-      addInterval(
-        () => {
-          if (
-            !bot ||
-            !botState.connected ||
-            typeof bot.setControlState !== "function"
-          )
-            return;
-          try {
-            const yaw = Math.random() * Math.PI * 2;
-            bot.look(yaw, 0, true);
-            bot.setControlState("forward", true);
-            setTimeout(
-              () => {
-                if (bot && typeof bot.setControlState === "function")
-                  bot.setControlState("forward", false);
-              },
-              500 + Math.floor(Math.random() * 1500),
-            );
-            botState.lastActivity = Date.now();
-          } catch (e) {
-            addLog("[AntiAFK] Walk error:", e.message);
-          }
-        },
-        120000 + Math.floor(Math.random() * 360000),
-      );
-    }
-
-    // Sneak occasionnel (pas permanent) - un humain ne reste pas toujours accroupi
-    if (config.utils["anti-afk"].sneak) {
-      const scheduleSneak = () => {
-        const delay = 45000 + Math.floor(Math.random() * 90000);
-        setTimeout(() => {
-          if (!bot || !botState.connected || typeof bot.setControlState !== "function") {
-            scheduleSneak(); return;
-          }
-          try {
-            bot.setControlState("sneak", true);
-            const dur = 2000 + Math.floor(Math.random() * 6000);
-            setTimeout(() => {
-              try { if (bot) bot.setControlState("sneak", false); } catch(e) {}
-              scheduleSneak();
-            }, dur);
-          } catch(e) { scheduleSneak(); }
-        }, delay);
-      };
-      scheduleSneak();
-    }
-
-    // Ouverture aléatoire de l'inventaire (comportement humain typique)
-    const scheduleInventory = () => {
-      const delay = 180000 + Math.floor(Math.random() * 300000);
-      setTimeout(() => {
-        if (!bot || !botState.connected) { scheduleInventory(); return; }
-        try {
-          bot.openInventory && bot.openInventory();
-          setTimeout(() => {
-            try { if (bot && bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch(e) {}
-            scheduleInventory();
-          }, 2000 + Math.floor(Math.random() * 4000));
-        } catch(e) { scheduleInventory(); }
-      }, delay);
-    };
-    scheduleInventory();
-  }
-
-  // ---------- MOVEMENT MODULES ----------
-  // FIX: check top-level movement.enabled flag
-  if (config.movement && config.movement.enabled !== false) {
-    // FIX: circle-walk and random-jump both jump - only run one jumping mechanism
-    // random-jump is skipped if anti-afk jump is handled elsewhere; we only use random-jump here
-    if (
-      config.movement["circle-walk"] &&
-      config.movement["circle-walk"].enabled
-    ) {
-      startCircleWalk(bot, defaultMove);
-    }
-    // FIX: only run random-jump if circle-walk is NOT running (circle-walk also keeps bot moving)
-    if (
-      config.movement["random-jump"] &&
-      config.movement["random-jump"].enabled &&
-      !(
-        config.movement["circle-walk"] && config.movement["circle-walk"].enabled
-      )
-    ) {
-      startRandomJump(bot);
-    }
-    if (
-      config.movement["look-around"] &&
-      config.movement["look-around"].enabled
-    ) {
-      startLookAround(bot);
-    }
-  }
-
-  // ---------- CUSTOM MODULES ----------
-  // FIX: avoidMobs AND combatModule conflict - if combat is enabled, don't run avoidMobs at the same time
-  if (config.modules.avoidMobs && !config.modules.combat) {
-    avoidMobs(bot);
-  }
-  if (config.modules.combat) {
-    combatModule(bot, mcData);
-  }
-  if (config.modules.beds) {
-    bedModule(bot, mcData);
-  }
-  if (config.modules.chat) {
-    chatModule(bot);
-  }
-
-  addLog("[Modules] All modules initialized!");
-}
-
-// ============================================================
-// MOVEMENT HELPERS
-// ============================================================
-function startCircleWalk(bot, defaultMove) {
-  const radius = config.movement["circle-walk"].radius;
-  const baseSpeed = config.movement["circle-walk"].speed;
-  let originX = null;
-  let originZ = null;
-  let isPaused = false;
-
-  const scheduleNext = () => {
-    if (!bot || !botState.connected) return;
-    const jitter = Math.floor(Math.random() * baseSpeed * 0.8);
-    const delay = baseSpeed + jitter;
-    setTimeout(doStep, delay);
-  };
-
-  const doStep = () => {
-    if (!bot || !botState.connected) { scheduleNext(); return; }
-
-    if (originX === null) {
-      originX = bot.entity.position.x;
-      originZ = bot.entity.position.z;
-    }
-
-    if (isPaused) { scheduleNext(); return; }
-
-    try {
-      const angle = Math.random() * Math.PI * 2;
-      const dist  = (0.4 + Math.random() * 0.6) * radius;
-      const x = originX + Math.cos(angle) * dist;
-      const z = originZ + Math.sin(angle) * dist;
-
-      bot.pathfinder.setMovements(defaultMove);
-      bot.pathfinder.setGoal(
-        new GoalBlock(Math.floor(x), Math.floor(bot.entity.position.y), Math.floor(z))
-      );
-      botState.lastActivity = Date.now();
-    } catch (e) {
-      addLog("[Walk] Error:", e.message);
-    }
-    scheduleNext();
-  };
-
-  const schedulePause = () => {
-    const pauseIn = 120000 + Math.floor(Math.random() * 180000);
-    setTimeout(() => {
-      if (!bot || !botState.connected) { schedulePause(); return; }
-      isPaused = true;
-      try { bot.pathfinder.setGoal(null); } catch(e) {}
-      const pauseDur = 15000 + Math.floor(Math.random() * 45000);
-      addLog(`[Walk] Pausing movement for ${Math.round(pauseDur/1000)}s`);
-      setTimeout(() => { isPaused = false; schedulePause(); }, pauseDur);
-    }, pauseIn);
-  };
-
-  doStep();
-  schedulePause();
-}
-
-function startRandomJump(bot) {
-  const scheduleJump = () => {
-    const base = config.movement["random-jump"].interval;
-    const delay = base * 0.5 + Math.floor(Math.random() * base * 1.5);
-    setTimeout(() => {
-      if (!bot || !botState.connected || typeof bot.setControlState !== "function") {
-        scheduleJump(); return;
-      }
-      try {
-        bot.setControlState("jump", true);
-        setTimeout(() => {
-          if (bot && typeof bot.setControlState === "function")
-            bot.setControlState("jump", false);
-        }, 200 + Math.floor(Math.random() * 200));
-        botState.lastActivity = Date.now();
-      } catch (e) {}
-      scheduleJump();
-    }, delay);
-  };
-  scheduleJump();
-}
-
-function startLookAround(bot) {
-  const scheduleLook = () => {
-    const base = config.movement["look-around"].interval;
-    const delay = base * 0.4 + Math.floor(Math.random() * base * 2.5);
-    setTimeout(() => {
-      if (!bot || !botState.connected) { scheduleLook(); return; }
-      try {
-        const yaw   = Math.random() * Math.PI * 2 - Math.PI;
-        const pitch = (Math.random() - 0.5) * (Math.PI / 2);
-        bot.look(yaw, pitch, false);
-        botState.lastActivity = Date.now();
-      } catch (e) {}
-      scheduleLook();
-    }, delay);
-  };
-  scheduleLook();
-}
+const DISCORD_RATE_LIMIT_MS = 5000;
 
 // ============================================================
 // SHARED BED TRACKER - prevents multiple bots using the same bed
 // ============================================================
 const occupiedBeds = new Set(); // keys: "x,y,z"
-
-// ============================================================
-// CUSTOM MODULES
-// ============================================================
-
-// Avoid mobs/players
-// FIX: e.username only exists on players; use e.name for mobs - now handled properly
-function avoidMobs(bot) {
-  const safeDistance = 5;
-  addInterval(() => {
-    if (
-      !bot ||
-      !botState.connected ||
-      typeof bot.setControlState !== "function"
-    )
-      return;
-    try {
-      const entities = Object.values(bot.entities).filter(
-        (e) =>
-          e.type === "mob" ||
-          (e.type === "player" && e.username !== bot.username),
-      );
-      for (const e of entities) {
-        if (!e.position) continue;
-        const distance = bot.entity.position.distanceTo(e.position);
-        if (distance < safeDistance) {
-          bot.setControlState("back", true);
-          setTimeout(() => {
-            if (bot && typeof bot.setControlState === "function")
-              bot.setControlState("back", false);
-          }, 500);
-          break;
-        }
-      }
-    } catch (e) {
-      addLog("[AvoidMobs] Error:", e.message);
-    }
-  }, 2000);
-}
-
-// Combat module
-// FIX: attack cooldown for 1.9+ (600ms minimum between attacks)
-// FIX: lock onto a target for multiple ticks instead of randomly switching every tick
-// FIX: autoEat - use i.foodPoints directly (mineflayer item property) instead of broken mcData lookup
-function combatModule(bot, mcData) {
-  let lastAttackTime = 0;
-  let lockedTarget = null;
-  let lockedTargetExpiry = 0;
-
-  // FIX: use physicsTick (not the deprecated physicTick)
-  bot.on("physicsTick", () => {
-    if (!bot || !botState.connected) return;
-    if (!config.combat["attack-mobs"]) return;
-
-    const now = Date.now();
-    // FIX: 1.9+ attack cooldown - respect at least 600ms between swings
-    if (now - lastAttackTime < 620) return;
-
-    try {
-      // FIX: only pick a new target if current one is gone or lock expired
-      if (
-        lockedTarget &&
-        now < lockedTargetExpiry &&
-        bot.entities[lockedTarget.id] &&
-        lockedTarget.position
-      ) {
-        const dist = bot.entity.position.distanceTo(lockedTarget.position);
-        if (dist < 4) {
-          bot.attack(lockedTarget);
-          lastAttackTime = now;
-          return;
-        } else {
-          lockedTarget = null;
-        }
-      }
-
-      // Pick a new target
-      const mobs = Object.values(bot.entities).filter(
-        (e) =>
-          e.type === "mob" &&
-          e.position &&
-          bot.entity.position.distanceTo(e.position) < 4,
-      );
-      if (mobs.length > 0) {
-        lockedTarget = mobs[0];
-        lockedTargetExpiry = now + 3000; // stick to same mob for 3 seconds
-        bot.attack(lockedTarget);
-        lastAttackTime = now;
-      }
-    } catch (e) {
-      addLog("[Combat] Error:", e.message);
-    }
-  });
-
-  // FIX: autoEat - check foodPoints property on the item directly (works reliably)
-  bot.on("health", () => {
-    if (!config.combat["auto-eat"]) return;
-    try {
-      if (bot.food < 14) {
-        const food = bot.inventory
-          .items()
-          .find((i) => i.foodPoints && i.foodPoints > 0);
-        if (food) {
-          bot
-            .equip(food, "hand")
-            .then(() => bot.consume())
-            .catch((e) => addLog("[AutoEat] Error:", e.message));
-        }
-      }
-    } catch (e) {
-      addLog("[AutoEat] Error:", e.message);
-    }
-  });
-}
-
-// Bed module
-// FIX: bot.isSleeping can be stale; use a local isTryingToSleep guard to prevent double-sleep errors
-// FIX: place-night was false in default settings - documentation note added
-// FIX: use occupiedBeds set so multiple bots never claim the same bed
-function bedModule(bot, mcData) {
-  let isTryingToSleep = false;
-  let myBedKey = null;
-
-  addInterval(async () => {
-    if (!bot || !botState.connected) return;
-    if (!config.beds["place-night"]) return;
-
-    try {
-      if (!bot.time) return;
-      const isNight =
-        bot.time.timeOfDay >= 12500 && bot.time.timeOfDay <= 23500;
-
-      if (isNight && !isTryingToSleep) {
-        const bedBlock = bot.findBlock({
-          matching: (block) => {
-            if (!block.name.includes("bed")) return false;
-            const k = `${block.position.x},${block.position.y},${block.position.z}`;
-            return !occupiedBeds.has(k);
-          },
-          maxDistance: 8,
-        });
-
-        if (bedBlock) {
-          myBedKey = `${bedBlock.position.x},${bedBlock.position.y},${bedBlock.position.z}`;
-          occupiedBeds.add(myBedKey);
-          isTryingToSleep = true;
-          try {
-            await bot.sleep(bedBlock);
-            addLog("[Bed] Sleeping...");
-          } catch (e) {
-            // Can't sleep - maybe not night enough or monsters nearby
-          } finally {
-            isTryingToSleep = false;
-            if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
-          }
-        }
-      }
-    } catch (e) {
-      isTryingToSleep = false;
-      if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
-      if (e.message) addLog("[Bed] Error: " + e.message);
-    }
-  }, 10000);
-}
-
-// Chat module
-// FIX: wire up discord.events.chat flag
-function chatModule(bot) {
-  bot.on("chat", (username, message) => {
-    if (!bot || username === bot.username) return;
-
-    try {
-      // FIX: send chat events to Discord if enabled
-      if (
-        config.discord &&
-        config.discord.enabled &&
-        config.discord.events &&
-        config.discord.events.chat
-      ) {
-        sendDiscordWebhook(`💬 **${username}**: ${message}`, 0x7289da);
-      }
-
-      // Réponses automatiques désactivées (bot ne doit pas envoyer de messages dans le tchat)
-      // if (config.chat && config.chat.respond) { ... }
-    } catch (e) {
-      addLog("[Chat] Error:", e.message);
-    }
-  });
-}
 
 // ============================================================
 // CONSOLE COMMANDS
@@ -2465,82 +1729,21 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
 
 // ============================================================
 // CRASH RECOVERY - IMMORTAL MODE
-// FIX: guard against uncaughtException stacking reconnects when isReconnecting is already true
+// Chaque bot a son propre watchdog ; l'exception globale log et laisse faire
 // ============================================================
 process.on("uncaughtException", (err) => {
   const msg = err.message || "Unknown";
   addLog(`[FATAL] Uncaught Exception: ${msg}`);
   botState.errors.push({ type: "uncaught", message: msg, time: Date.now() });
-
-  // Cap errors array to prevent memory leak over long uptimes
-  if (botState.errors.length > 100) {
-    botState.errors = botState.errors.slice(-50);
-  }
-
-  const isNetworkError =
-    msg.includes("PartialReadError") ||
-    msg.includes("ECONNRESET") ||
-    msg.includes("EPIPE") ||
-    msg.includes("ETIMEDOUT") ||
-    msg.includes("timed out") ||
-    msg.includes("write after end") ||
-    msg.includes("This socket has been ended");
-
-  if (isNetworkError) {
-    addLog("[FATAL] Known network/protocol error - recovering gracefully...");
-  }
-
-  // ALWAYS recover — bot must never stay disconnected
-  clearAllIntervals();
-  botState.connected = false;
-
-  // FIX: reset isReconnecting if it was stuck, then schedule reconnect
-  if (isReconnecting) {
-    addLog(
-      "[FATAL] isReconnecting was stuck - resetting before crash recovery",
-    );
-    isReconnecting = false;
-    // BUG FIX: was referencing non-existent 'reconnectTimeout' — correct name is 'reconnectTimeoutId'
-    if (reconnectTimeoutId) {
-      clearTimeout(reconnectTimeoutId);
-      reconnectTimeoutId = null;
-    }
-  }
-
-  setTimeout(
-    () => {
-      scheduleReconnect();
-    },
-    isNetworkError ? 5000 : 10000,
-  );
+  if (botState.errors.length > 100) botState.errors = botState.errors.slice(-50);
+  // Chaque bot gère sa propre reconnexion via ses event handlers et watchdog
 });
 
 process.on("unhandledRejection", (reason) => {
   const msg = String(reason);
-  addLog(`[FATAL] Unhandled Rejection: ${reason}`);
+  addLog(`[FATAL] Unhandled Rejection: ${msg}`);
   botState.errors.push({ type: "rejection", message: msg, time: Date.now() });
-  if (botState.errors.length > 100) {
-    botState.errors = botState.errors.slice(-50);
-  }
-
-  const isNetworkError =
-    msg.includes("ETIMEDOUT") ||
-    msg.includes("ECONNRESET") ||
-    msg.includes("EPIPE") ||
-    msg.includes("ENOTFOUND") ||
-    msg.includes("timed out") ||
-    msg.includes("PartialReadError");
-
-  if (isNetworkError && !isReconnecting) {
-    addLog("[FATAL] Network rejection — triggering reconnect...");
-    clearAllIntervals();
-    botState.connected = false;
-    if (bot) {
-      try { bot.end(); } catch (_) {}
-      bot = null;
-    }
-    scheduleReconnect();
-  }
+  if (botState.errors.length > 100) botState.errors = botState.errors.slice(-50);
 });
 
 process.on("SIGTERM", () => {
@@ -2566,13 +1769,3 @@ addLog(
 addLog("=".repeat(50));
 
 applyBotCount(activeBotCount);
-createBot();
-
-// Watchdog : toutes les 30s, si l'utilisateur veut le bot mais qu'il n'est ni connecté ni en cours de reconnexion → force
-setInterval(() => {
-  if (botRunning && !botState.connected && !isReconnecting && !reconnectTimeoutId) {
-    addLog("[Watchdog] Bot bloqué détecté — reconnexion forcée...");
-    botState.reconnectAttempts = 0;
-    scheduleReconnect();
-  }
-}, 30000);
