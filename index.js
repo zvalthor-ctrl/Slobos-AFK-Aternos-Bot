@@ -1306,6 +1306,10 @@ function makeExtraBot(index) {
         try { eBot.loadPlugin(pathfinder); } catch(e) {}
         const eMcData = require("minecraft-data")(eBot.version);
         const eMove = new Movements(eBot, eMcData);
+        eMove.canDig = false;
+        eMove.allowFreeMotion = false;
+        eMove.liquidCost = 1000;
+        eMove.fallDamageCost = 1000;
 
         // ── Circle walk aléatoire ──
         if (config.movement && config.movement["circle-walk"] && config.movement["circle-walk"].enabled) {
