@@ -1335,17 +1335,25 @@ function makeBot(index) {
         }
 
         // ── Mémorisation des /tp (forcedMove) ──
+        let _lastTpX = null, _lastTpZ = null, _tpDebounce = null;
         eBot.on("forcedMove", () => {
           if (!connected || !eBot.entity) return;
           const p = eBot.entity.position;
-          originX = Math.floor(p.x);
-          originZ = Math.floor(p.z);
-          botPositions[index] = { x: originX, y: Math.floor(p.y), z: originZ };
-          saveBotPositions();
-          addLog(`[Bot#${index}] 📍 /tp sauvegardé → X=${originX} Y=${Math.floor(p.y)} Z=${originZ}`);
+          const nx = Math.floor(p.x), ny = Math.floor(p.y), nz = Math.floor(p.z);
+          // Ignorer les micro-corrections anti-cheat (<4 blocs de déplacement)
+          if (_lastTpX !== null && Math.abs(nx - _lastTpX) < 4 && Math.abs(nz - _lastTpZ) < 4) return;
+          _lastTpX = nx; _lastTpZ = nz;
+          clearTimeout(_tpDebounce);
+          _tpDebounce = setTimeout(() => {
+            originX = nx; originZ = nz;
+            botPositions[index] = { x: nx, y: ny, z: nz };
+            saveBotPositions();
+            addLog(`[Bot#${index}] 📍 /tp sauvegardé → X=${nx} Y=${ny} Z=${nz}`);
+          }, 500);
         });
 
         // ── Circle walk aléatoire ──
+        let botSleeping = false; // partagé avec la logique lit
         if (config.movement && config.movement["circle-walk"] && config.movement["circle-walk"].enabled) {
           const radius = config.movement["circle-walk"].radius || 4;
           let isPaused = false;
@@ -1356,7 +1364,7 @@ function makeBot(index) {
             setTimeout(() => {
               if (!eBot || !connected) { doStep(); return; }
               if (originX === null) { originX = eBot.entity.position.x; originZ = eBot.entity.position.z; }
-              if (isPaused) { doStep(); return; }
+              if (isPaused || botSleeping) { doStep(); return; }
               try {
                 const angle = Math.random() * Math.PI * 2;
                 const dist  = (0.4 + Math.random() * 0.6) * radius;
@@ -1418,13 +1426,11 @@ function makeBot(index) {
 
         // ── Lit la nuit (shared bed tracker) ──
         if (config.modules && config.modules.beds && config.beds && config.beds["place-night"]) {
-          let isTryingToSleep = false;
           let myBedKey = null;
           setInterval(async () => {
-            if (!eBot || !connected || isTryingToSleep) return;
+            if (!eBot || !connected || botSleeping) return;
             try {
-              if (!eBot.time) return;
-              const tod = eBot.time.timeOfDay;
+              const tod = eBot.time?.timeOfDay ?? -1;
               const isNight = tod >= 12541 && tod <= 23458;
               if (!isNight) return;
               const bed = eBot.findBlock({
@@ -1435,23 +1441,25 @@ function makeBot(index) {
                 },
                 maxDistance: 50,
               });
-              if (!bed) { addLog(`[Bot#${index}] Aucun lit trouvé (<50 blocs)`); return; }
+              if (!bed) { addLog(`[Bot#${index}] Aucun lit trouvé (<50 blocs) — tod=${tod}`); return; }
               myBedKey = `${bed.position.x},${bed.position.y},${bed.position.z}`;
               occupiedBeds.add(myBedKey);
-              isTryingToSleep = true;
+              botSleeping = true;
+              // Stopper le circle-walk
+              try { eBot.pathfinder.setGoal(null); } catch(e) {}
               try {
-                // Se déplacer à côté du lit avant de dormir
+                // Se déplacer à côté du lit puis dormir
                 await eBot.pathfinder.goto(new GoalNear(bed.position.x, bed.position.y, bed.position.z, 2));
                 await eBot.sleep(bed);
-                addLog(`[Bot#${index}] Dort dans le lit ${myBedKey}`);
+                addLog(`[Bot#${index}] 😴 Dort dans le lit ${myBedKey}`);
               } catch(e) {
                 addLog(`[Bot#${index}] Échec sommeil: ${e.message}`);
               } finally {
-                isTryingToSleep = false;
+                botSleeping = false;
                 if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
               }
             } catch(e) {
-              isTryingToSleep = false;
+              botSleeping = false;
               if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
             }
           }, 5000);
