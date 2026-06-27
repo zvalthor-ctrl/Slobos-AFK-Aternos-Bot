@@ -1441,11 +1441,18 @@ function makeBot(index) {
             .filter(b => b.name && b.name.includes("_bed"))
             .map(b => b.id);
 
+          // Lits refusés par le serveur cette nuit (villageois, etc.) — remis à zéro à l'aube
+          const nightBlacklist = new Set();
+          let _wasNight = false;
+
           setInterval(async () => {
             const tod = eBot?.time?.timeOfDay ?? -1;
+            const isNight = tod >= 12541 && tod <= 23458;
+            // Remettre à zéro la blacklist à l'aube
+            if (_wasNight && !isNight) { nightBlacklist.clear(); }
+            _wasNight = isNight;
             if (!eBot || !connected || botSleeping || eBot.isSleeping) return;
             try {
-              const isNight = tod >= 12541 && tod <= 23458;
               if (!isNight) return;
               // Chercher un lit libre dans 50 blocs via IDs (plus fiable que matching function)
               // Récupère les 2 clés d'un lit (tête + pied sont des blocs adjacents de même nom)
@@ -1468,24 +1475,37 @@ function makeBot(index) {
                 const b = eBot.findBlock({ matching: id, maxDistance: 20 });
                 if (!b) continue;
                 const keys = bedBlockKeys(b);
-                if (keys.some(k => occupiedBeds.has(k))) continue; // lit occupé (tête ou pied)
+                // Ignorer si occupé par un autre bot OU blacklisté pour cette nuit
+                if (keys.some(k => occupiedBeds.has(k) || nightBlacklist.has(k))) continue;
                 bed = b; myBedKeys = keys; break;
               }
-              if (!bed) { addLog(`[Bot#${index}] Aucun lit libre (<20 blocs) — reste en place`); return; }
+              if (!bed) return; // reste en place silencieusement
               myBedKey = myBedKeys[0];
-              myBedKeys.forEach(k => occupiedBeds.add(k)); // marquer tête ET pied
+              myBedKeys.forEach(k => occupiedBeds.add(k));
               botSleeping = true;
-              // Stopper le circle-walk
               try { eBot.pathfinder.setGoal(null); } catch(_) {}
+              let serverRefused = false;
               try {
                 await eBot.pathfinder.goto(new GoalNear(bed.position.x, bed.position.y, bed.position.z, 2));
                 await eBot.sleep(bed);
                 addLog(`[Bot#${index}] 😴 Dort dans le lit ${myBedKey}`);
               } catch(e) {
-                addLog(`[Bot#${index}] Échec sommeil: ${e.message}`);
+                const msg = e.message || '';
+                if (msg.includes('occupied') || msg.includes('villager')) {
+                  // Lit revendiqué par un villageois — blacklister pour cette nuit
+                  myBedKeys.forEach(k => nightBlacklist.add(k));
+                  addLog(`[Bot#${index}] Lit ${myBedKey} bloqué (villageois?) — ignoré cette nuit`);
+                  serverRefused = true;
+                } else {
+                  addLog(`[Bot#${index}] Échec sommeil: ${msg}`);
+                }
               } finally {
                 botSleeping = false;
-                myBedKeys.forEach(k => occupiedBeds.delete(k)); myBedKeys = []; myBedKey = null;
+                // Si le serveur a refusé, le lit reste dans occupiedBeds pour éviter de réessayer
+                if (!serverRefused) {
+                  myBedKeys.forEach(k => occupiedBeds.delete(k));
+                }
+                myBedKeys = []; myBedKey = null;
               }
             } catch(e) {
               addLog(`[Bot#${index}] [sleep-err] ${e.message}`);
