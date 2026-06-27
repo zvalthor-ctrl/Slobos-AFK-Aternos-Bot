@@ -1441,16 +1441,32 @@ function makeBot(index) {
               const isNight = tod >= 12541 && tod <= 23458;
               if (!isNight) return;
               // Chercher un lit libre dans 50 blocs via IDs (plus fiable que matching function)
+              // Récupère les 2 clés d'un lit (tête + pied sont des blocs adjacents de même nom)
+              const bedBlockKeys = (b) => {
+                const keys = [`${Math.floor(b.position.x)},${Math.floor(b.position.y)},${Math.floor(b.position.z)}`];
+                const offsets = [[1,0],[-1,0],[0,1],[0,-1]];
+                for (const [dx,dz] of offsets) {
+                  const nb = eBot.blockAt(b.position.offset(dx, 0, dz));
+                  if (nb && nb.name === b.name) {
+                    keys.push(`${Math.floor(nb.position.x)},${Math.floor(nb.position.y)},${Math.floor(nb.position.z)}`);
+                    break;
+                  }
+                }
+                return keys;
+              };
+
               let bed = null;
+              let myBedKeys = [];
               for (const id of _bedIds) {
                 const b = eBot.findBlock({ matching: id, maxDistance: 50 });
                 if (!b) continue;
-                const k = `${b.position.x},${b.position.y},${b.position.z}`;
-                if (!occupiedBeds.has(k)) { bed = b; break; }
+                const keys = bedBlockKeys(b);
+                if (keys.some(k => occupiedBeds.has(k))) continue; // lit occupé (tête ou pied)
+                bed = b; myBedKeys = keys; break;
               }
               if (!bed) { addLog(`[Bot#${index}] Aucun lit libre (<50 blocs) — tod=${tod}`); return; }
-              myBedKey = `${bed.position.x},${bed.position.y},${bed.position.z}`;
-              occupiedBeds.add(myBedKey);
+              myBedKey = myBedKeys[0];
+              myBedKeys.forEach(k => occupiedBeds.add(k)); // marquer tête ET pied
               botSleeping = true;
               // Stopper le circle-walk
               try { eBot.pathfinder.setGoal(null); } catch(_) {}
@@ -1462,7 +1478,7 @@ function makeBot(index) {
                 addLog(`[Bot#${index}] Échec sommeil: ${e.message}`);
               } finally {
                 botSleeping = false;
-                if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
+                myBedKeys.forEach(k => occupiedBeds.delete(k)); myBedKeys = []; myBedKey = null;
               }
             } catch(e) {
               addLog(`[Bot#${index}] [sleep-err] ${e.message}`);
