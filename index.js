@@ -1335,16 +1335,18 @@ function makeBot(index) {
         }
 
         // ── Mémorisation des /tp (forcedMove) ──
-        let _lastTpX = null, _lastTpZ = null, _tpDebounce = null;
+        // Debounce : attend la fin du burst de corrections anti-cheat (500ms)
+        // puis ne log que si la position finale a vraiment changé depuis la dernière sauvegarde.
+        let _tpDebounce = null;
+        let _lastSavedX = null, _lastSavedZ = null;
         eBot.on("forcedMove", () => {
           if (!connected || !eBot.entity) return;
           const p = eBot.entity.position;
           const nx = Math.floor(p.x), ny = Math.floor(p.y), nz = Math.floor(p.z);
-          // Ignorer les micro-corrections anti-cheat (<4 blocs de déplacement)
-          if (_lastTpX !== null && Math.abs(nx - _lastTpX) < 4 && Math.abs(nz - _lastTpZ) < 4) return;
-          _lastTpX = nx; _lastTpZ = nz;
           clearTimeout(_tpDebounce);
           _tpDebounce = setTimeout(() => {
+            if (_lastSavedX === nx && _lastSavedZ === nz) return; // rien de nouveau
+            _lastSavedX = nx; _lastSavedZ = nz;
             originX = nx; originZ = nz;
             botPositions[index] = { x: nx, y: ny, z: nz };
             saveBotPositions();
