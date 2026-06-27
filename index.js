@@ -1319,6 +1319,13 @@ function makeBot(index) {
         eMove.liquidCost = 1000;
         eMove.fallDamageCost = 1000;
 
+        // ── Interdire tout saut (pathfinder inclus) ──
+        const _origSetControl = eBot.setControlState.bind(eBot);
+        eBot.setControlState = (ctrl, val) => {
+          if (ctrl === 'jump') return;
+          return _origSetControl(ctrl, val);
+        };
+
         // ── Origine de marche — initialisée depuis la mémoire ou la position de spawn ──
         const _saved = botPositions[index];
         let originX = _saved ? _saved.x : null;
@@ -1458,13 +1465,13 @@ function makeBot(index) {
               let bed = null;
               let myBedKeys = [];
               for (const id of _bedIds) {
-                const b = eBot.findBlock({ matching: id, maxDistance: 50 });
+                const b = eBot.findBlock({ matching: id, maxDistance: 20 });
                 if (!b) continue;
                 const keys = bedBlockKeys(b);
                 if (keys.some(k => occupiedBeds.has(k))) continue; // lit occupé (tête ou pied)
                 bed = b; myBedKeys = keys; break;
               }
-              if (!bed) { addLog(`[Bot#${index}] Aucun lit libre (<50 blocs) — tod=${tod}`); return; }
+              if (!bed) { addLog(`[Bot#${index}] Aucun lit libre (<20 blocs) — reste en place`); return; }
               myBedKey = myBedKeys[0];
               myBedKeys.forEach(k => occupiedBeds.add(k)); // marquer tête ET pied
               botSleeping = true;
