@@ -1427,28 +1427,32 @@ function makeBot(index) {
         // ── Lit la nuit (shared bed tracker) ──
         if (config.modules && config.modules.beds && config.beds && config.beds["place-night"]) {
           let myBedKey = null;
+          // IDs de blocs lit calculés une fois au spawn
+          const _bedIds = Object.values(eMcData.blocksByName)
+            .filter(b => b.name && b.name.includes("_bed"))
+            .map(b => b.id);
+
           setInterval(async () => {
-            if (!eBot || !connected || botSleeping) return;
+            const tod = eBot?.time?.timeOfDay ?? -1;
+            if (!eBot || !connected || botSleeping || eBot.isSleeping) return;
             try {
-              const tod = eBot.time?.timeOfDay ?? -1;
               const isNight = tod >= 12541 && tod <= 23458;
               if (!isNight) return;
-              const bed = eBot.findBlock({
-                matching: (b) => {
-                  if (!b.name.includes("bed")) return false;
-                  const k = `${b.position.x},${b.position.y},${b.position.z}`;
-                  return !occupiedBeds.has(k);
-                },
-                maxDistance: 50,
-              });
-              if (!bed) { addLog(`[Bot#${index}] Aucun lit trouvé (<50 blocs) — tod=${tod}`); return; }
+              // Chercher un lit libre dans 50 blocs via IDs (plus fiable que matching function)
+              let bed = null;
+              for (const id of _bedIds) {
+                const b = eBot.findBlock({ matching: id, maxDistance: 50 });
+                if (!b) continue;
+                const k = `${b.position.x},${b.position.y},${b.position.z}`;
+                if (!occupiedBeds.has(k)) { bed = b; break; }
+              }
+              if (!bed) { addLog(`[Bot#${index}] Aucun lit libre (<50 blocs) — tod=${tod}`); return; }
               myBedKey = `${bed.position.x},${bed.position.y},${bed.position.z}`;
               occupiedBeds.add(myBedKey);
               botSleeping = true;
               // Stopper le circle-walk
-              try { eBot.pathfinder.setGoal(null); } catch(e) {}
+              try { eBot.pathfinder.setGoal(null); } catch(_) {}
               try {
-                // Se déplacer à côté du lit puis dormir
                 await eBot.pathfinder.goto(new GoalNear(bed.position.x, bed.position.y, bed.position.z, 2));
                 await eBot.sleep(bed);
                 addLog(`[Bot#${index}] 😴 Dort dans le lit ${myBedKey}`);
@@ -1459,6 +1463,7 @@ function makeBot(index) {
                 if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
               }
             } catch(e) {
+              addLog(`[Bot#${index}] [sleep-err] ${e.message}`);
               botSleeping = false;
               if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
             }
