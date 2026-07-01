@@ -1249,8 +1249,9 @@ function makeBot(index) {
   }
 
   function connect() {
-    connecting = true;
-    cleanup();
+    cleanup();           // incrémente connectionId, remet connecting = false
+    connecting = true;   // mis APRÈS cleanup pour ne pas être écrasé
+    const myConnId = connectionId;  // capturé AVANT createBot
     if (!running) { connecting = false; return; }
     addLog(`[Bot#${index}] Connecting as ${username}...`);
     try {
@@ -1267,15 +1268,16 @@ function makeBot(index) {
       });
 
       const spawnTimeout = setTimeout(() => {
+        if (myConnId !== connectionId) return;
         if (!connected) { addLog(`[Bot#${index}] Spawn timeout`); schedRecon(); }
       }, 90000);
 
       eBot.once("spawn", () => {
+        if (myConnId !== connectionId) return;
         clearTimeout(spawnTimeout);
         connected = true;
         connecting = false;
         attempts = 0;
-        const myConnId = connectionId;
         if (index === 0) {
           bot = eBot;
           botState.connected = true;
@@ -1696,6 +1698,7 @@ function makeBot(index) {
       });
 
       eBot.on("end", () => {
+        if (myConnId !== connectionId) return;
         connected = false;
         if (index === 0) { botState.connected = false; bot = null; }
         if (config.discord && config.discord.events && config.discord.events.disconnect) {
@@ -1703,7 +1706,11 @@ function makeBot(index) {
         }
         schedRecon();
       });
-      eBot.on("error", (err) => { addLog(`[Bot#${index}] Erreur: ${err.message || err}`); schedRecon(); });
+      eBot.on("error", (err) => {
+        if (myConnId !== connectionId) return;
+        addLog(`[Bot#${index}] Erreur: ${err.message || err}`);
+        schedRecon();
+      });
     } catch(e) {
       addLog(`[Bot#${index}] Erreur: ${e.message}`);
       connecting = false;
