@@ -167,8 +167,8 @@ app.get('/', (req, res) => {
           >
             <div id="status-icon" aria-hidden="true" class="status-icon offline">&#x2717;</div>
             <div>
-              <div id="status-label" class="status-label offline">Connecting…</div>
-              <div id="status-detail" class="status-detail">Establishing connection</div>
+              <div id="status-label" class="status-label offline">Stopped</div>
+              <div id="status-detail" class="status-detail">Click "Start bot" to connect</div>
             </div>
           </section>
 
@@ -238,6 +238,7 @@ app.get('/', (req, res) => {
               const r = await fetch('/health');
               const data = await r.json();
               const online = data.status === 'connected';
+              const running = data.running;
 
               const section = document.getElementById('status-section');
               const icon    = document.getElementById('status-icon');
@@ -248,8 +249,8 @@ app.get('/', (req, res) => {
               icon.className    = 'status-icon '    + (online ? 'online' : 'offline');
               icon.textContent  = online ? '✓' : '✗';
               label.className   = 'status-label '   + (online ? 'online' : 'offline');
-              label.textContent = online ? 'Connected' : 'Disconnected';
-              detail.textContent = online ? 'Bot is active on the server' : 'Attempting to reconnect';
+              label.textContent = online ? 'Connected' : (running ? 'Disconnected' : 'Stopped');
+              detail.textContent = online ? 'Bot is active on the server' : (running ? 'Attempting to reconnect…' : 'Click "Start bot" to connect');
 
               document.getElementById('uptime-text').textContent = formatUptime(data.uptime);
 
@@ -513,6 +514,7 @@ app.get("/tutorial", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     status: botState.connected ? "connected" : "disconnected",
+    running: botRunning,
     uptime: Math.floor((Date.now() - botState.startTime) / 1000),
     coords: bot && bot.entity ? bot.entity.position : null,
     lastActivity: botState.lastActivity,
@@ -1043,7 +1045,7 @@ app.get("/logs", (req, res) => {
   `);
 });
 
-let botRunning = true;
+let botRunning = false;
 
 app.post("/start", (req, res) => {
   if (botRunning) return res.json({ success: false, msg: "Already running" });
@@ -1209,8 +1211,10 @@ function makeBot(index) {
   let attempts = 0;
   let running = false;
   let wasThrottled = false;
+  let connectionId = 0;
 
   function cleanup() {
+    connectionId++;
     if (eBot) {
       try { eBot.removeAllListeners(); eBot.end(); } catch(e) {}
       eBot = null;
@@ -1267,6 +1271,7 @@ function makeBot(index) {
         clearTimeout(spawnTimeout);
         connected = true;
         attempts = 0;
+        const myConnId = connectionId;
         if (index === 0) {
           bot = eBot;
           botState.connected = true;
@@ -1371,6 +1376,7 @@ function makeBot(index) {
             const baseDelay = config.movement["circle-walk"].speed || 3000;
             const delay = baseDelay * 0.5 + Math.floor(Math.random() * baseDelay * 2);
             setTimeout(() => {
+              if (myConnId !== connectionId) return;
               if (!eBot || !connected) { doStep(); return; }
               if (originX === null) { originX = eBot.entity.position.x; originZ = eBot.entity.position.z; }
               if (isPaused || botSleeping) { doStep(); return; }
@@ -1392,6 +1398,7 @@ function makeBot(index) {
           // Pauses aléatoires
           const schedulePause = () => {
             setTimeout(() => {
+              if (myConnId !== connectionId) return;
               if (!eBot || !connected) { schedulePause(); return; }
               isPaused = true;
               try { eBot.pathfinder.setGoal(null); } catch(e) {}
@@ -1408,6 +1415,7 @@ function makeBot(index) {
             const base = config.movement["random-jump"].interval || 10000;
             const delay = base * 0.5 + Math.floor(Math.random() * base * 1.5);
             setTimeout(() => {
+              if (myConnId !== connectionId) return;
               if (!eBot || !connected) { schedJump(); return; }
               try {
                 eBot.setControlState("jump", true);
@@ -1425,6 +1433,7 @@ function makeBot(index) {
             const base = config.movement["look-around"].interval || 5000;
             const delay = base * 0.4 + Math.floor(Math.random() * base * 2.5);
             setTimeout(() => {
+              if (myConnId !== connectionId) return;
               if (!eBot || !connected) { schedLook(); return; }
               try { eBot.look(Math.random() * Math.PI * 2 - Math.PI, (Math.random() - 0.5) * (Math.PI / 2), false); } catch(e) {}
               schedLook();
@@ -1446,6 +1455,7 @@ function makeBot(index) {
           let _wasNight = false;
 
           setInterval(async () => {
+            if (myConnId !== connectionId) return;
             const tod = eBot?.time?.timeOfDay ?? -1;
             const isNight = tod >= 12541 && tod <= 23458;
             // Remettre à zéro la blacklist à l'aube
@@ -1517,6 +1527,7 @@ function makeBot(index) {
 
         // ── Anti-AFK : regard aléatoire supplémentaire (remplace swingArm pour éviter le geste de cassage) ──
         setInterval(() => {
+          if (myConnId !== connectionId) return;
           if (!eBot || !connected) return;
           try { eBot.look(Math.random() * Math.PI * 2 - Math.PI, (Math.random() - 0.3) * (Math.PI / 3), false); } catch(e) {}
         }, 15000 + Math.floor(Math.random() * 45000));
@@ -1538,12 +1549,14 @@ function makeBot(index) {
 
         // ── Hotbar cycling ──
         setInterval(() => {
+          if (myConnId !== connectionId) return;
           if (!eBot || !connected) return;
           try { eBot.setQuickBarSlot(Math.floor(Math.random() * 9)); } catch(e) {}
         }, 30000 + Math.floor(Math.random() * 90000));
 
         // ── Teabagging occasionnel ──
         setInterval(() => {
+          if (myConnId !== connectionId) return;
           if (!eBot || !connected || typeof eBot.setControlState !== "function") return;
           if (Math.random() > 0.9) {
             let count = 2 + Math.floor(Math.random() * 3);
@@ -1566,6 +1579,7 @@ function makeBot(index) {
         const scheduleExtraSneak = () => {
           const delay = 45000 + Math.floor(Math.random() * 90000);
           setTimeout(() => {
+            if (myConnId !== connectionId) return;
             if (!eBot || !connected || typeof eBot.setControlState !== "function") {
               scheduleExtraSneak(); return;
             }
@@ -1585,6 +1599,7 @@ function makeBot(index) {
         const scheduleExtraInventory = () => {
           const delay = 180000 + Math.floor(Math.random() * 300000);
           setTimeout(() => {
+            if (myConnId !== connectionId) return;
             if (!eBot || !connected) { scheduleExtraInventory(); return; }
             try {
               eBot.openInventory && eBot.openInventory();
@@ -1628,6 +1643,7 @@ function makeBot(index) {
         } else if (config.modules && config.modules.avoidMobs) {
           // ── Évitement des mobs ──
           setInterval(() => {
+            if (myConnId !== connectionId) return;
             if (!eBot || !connected || typeof eBot.setControlState !== "function") return;
             try {
               const entities = Object.values(eBot.entities).filter(e => e.type === "mob" || (e.type === "player" && e.username !== eBot.username));
