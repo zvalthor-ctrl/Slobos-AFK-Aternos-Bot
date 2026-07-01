@@ -1206,6 +1206,7 @@ function makeBot(index) {
   const username = base + String(index).padStart(2, "0");
   let eBot = null;
   let connected = false;
+  let connecting = false;
   let isRecon = false;
   let reconTimer = null;
   let attempts = 0;
@@ -1215,6 +1216,7 @@ function makeBot(index) {
 
   function cleanup() {
     connectionId++;
+    connecting = false;
     if (eBot) {
       try { eBot.removeAllListeners(); eBot.end(); } catch(e) {}
       eBot = null;
@@ -1247,8 +1249,9 @@ function makeBot(index) {
   }
 
   function connect() {
+    connecting = true;
     cleanup();
-    if (!running) return;
+    if (!running) { connecting = false; return; }
     addLog(`[Bot#${index}] Connecting as ${username}...`);
     try {
       const ver = config.server.version && config.server.version.trim() ? config.server.version : false;
@@ -1270,6 +1273,7 @@ function makeBot(index) {
       eBot.once("spawn", () => {
         clearTimeout(spawnTimeout);
         connected = true;
+        connecting = false;
         attempts = 0;
         const myConnId = connectionId;
         if (index === 0) {
@@ -1702,13 +1706,14 @@ function makeBot(index) {
       eBot.on("error", (err) => { addLog(`[Bot#${index}] Erreur: ${err.message || err}`); schedRecon(); });
     } catch(e) {
       addLog(`[Bot#${index}] Erreur: ${e.message}`);
+      connecting = false;
       schedRecon();
     }
   }
 
   // Watchdog for extra bots
   setInterval(() => {
-    if (running && !connected && !isRecon && !reconTimer) {
+    if (running && !connected && !connecting && !isRecon && !reconTimer) {
       addLog(`[Bot#${index}] Watchdog: reconnexion forcée`);
       attempts = 0;
       schedRecon();
