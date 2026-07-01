@@ -1330,12 +1330,21 @@ function makeBot(index) {
         eMove.liquidCost = 1000;
         eMove.fallDamageCost = 1000;
 
-        // ── Interdire tout saut (pathfinder inclus) ──
-        const _origSetControl = eBot.setControlState.bind(eBot);
-        eBot.setControlState = (ctrl, val) => {
-          if (ctrl === 'jump') return;
-          return _origSetControl(ctrl, val);
-        };
+        // ── Protéger les plantations : le pathfinder évite ces blocs (coût ×100) ──
+        // Inclut farmland : marcher dessus le transforme en dirt et détruit les cultures.
+        // Le saut est autorisé pour sortir d'un trou, mais le pathfinder ne passera
+        // jamais par ces blocs car leur coût est prohibitif.
+        const _cropNames = [
+          'wheat', 'carrots', 'potatoes', 'beetroots',
+          'melon_stem', 'pumpkin_stem', 'attached_melon_stem', 'attached_pumpkin_stem',
+          'nether_wart', 'cocoa', 'sweet_berry_bush',
+          'bamboo', 'bamboo_sapling', 'sugar_cane',
+          'chorus_plant', 'chorus_flower', 'farmland'
+        ];
+        for (const name of _cropNames) {
+          const _cb = eMcData.blocksByName[name];
+          if (_cb) eMove.blocksToAvoid.add(_cb.id);
+        }
 
         // ── Origine de marche — initialisée depuis la mémoire ou la position de spawn ──
         const _saved = botPositions[index];
