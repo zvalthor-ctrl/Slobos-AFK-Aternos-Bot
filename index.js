@@ -1459,15 +1459,18 @@ function makeBot(index) {
           // Lits refusés par le serveur cette nuit (villageois, etc.) — remis à zéro à l'aube
           const nightBlacklist = new Set();
           let _wasNight = false;
+          let _lastSleepFailAt = 0;
 
           setInterval(async () => {
             if (myConnId !== connectionId) return;
             const tod = eBot?.time?.timeOfDay ?? -1;
             const isNight = tod >= 12541 && tod <= 23458;
             // Remettre à zéro la blacklist à l'aube
-            if (_wasNight && !isNight) { nightBlacklist.clear(); }
+            if (_wasNight && !isNight) { nightBlacklist.clear(); _lastSleepFailAt = 0; }
             _wasNight = isNight;
             if (!eBot || !connected || botSleeping || eBot.isSleeping) return;
+            // Cooldown de 60s après un échec pour éviter de spammer le serveur
+            if (Date.now() - _lastSleepFailAt < 60000) return;
             try {
               if (!isNight) return;
               // Chercher un lit libre dans 50 blocs via IDs (plus fiable que matching function)
@@ -1507,6 +1510,7 @@ function makeBot(index) {
                 addLog(`[Bot#${index}] 😴 Dort dans le lit ${myBedKey}`);
               } catch(e) {
                 const msg = e.message || '';
+                _lastSleepFailAt = Date.now();
                 if (msg.includes('occupied') || msg.includes('villager')) {
                   // Lit revendiqué par un villageois — blacklister pour cette nuit
                   myBedKeys.forEach(k => nightBlacklist.add(k));
@@ -1528,7 +1532,7 @@ function makeBot(index) {
               botSleeping = false;
               if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
             }
-          }, 5000);
+          }, 15000);
         }
 
         // ── Anti-AFK : regard aléatoire supplémentaire (remplace swingArm pour éviter le geste de cassage) ──
