@@ -3,7 +3,7 @@
 const { addLog, getLogs } = require("./logger");
 const mineflayer = require("mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
-const { GoalBlock, GoalNear } = goals;
+const { GoalBlock, GoalNear, GoalXZ } = goals;
 const config = require("./settings.json");
 const fs = require("fs");
 const express = require("express");
@@ -1373,35 +1373,46 @@ function makeBot(index) {
         });
 
         // ── Circle walk aléatoire ──
+        // Utilise goto(GoalXZ) : un seul objectif actif à la fois, pas de spam de setGoal().
+        // Le bot attend d'arriver avant de choisir la prochaine destination.
+        // Si le chemin est bloqué (obstacle infranchissable), le timeout de 15s
+        // déclenche automatiquement un changement de direction.
         let botSleeping = false; // partagé avec la logique lit
         if (config.movement && config.movement["circle-walk"] && config.movement["circle-walk"].enabled) {
-          const radius = config.movement["circle-walk"].radius || 4;
+          const radius = config.movement["circle-walk"].radius || 5;
           let isPaused = false;
 
-          const doStep = () => {
-            const baseDelay = config.movement["circle-walk"].speed || 3000;
-            const delay = baseDelay * 0.5 + Math.floor(Math.random() * baseDelay * 2);
-            setTimeout(() => {
-              if (myConnId !== connectionId) return;
-              if (!eBot || !connected) { doStep(); return; }
-              if (originX === null) { originX = eBot.entity.position.x; originZ = eBot.entity.position.z; }
-              if (isPaused || botSleeping) { doStep(); return; }
+          const walkLoop = async () => {
+            while (myConnId === connectionId) {
+              if (!eBot || !connected || botSleeping || isPaused) {
+                await new Promise(r => setTimeout(r, 500));
+                continue;
+              }
+              if (originX === null) {
+                originX = eBot.entity.position.x;
+                originZ = eBot.entity.position.z;
+              }
               try {
                 const angle = Math.random() * Math.PI * 2;
-                const dist  = (0.4 + Math.random() * 0.6) * radius;
+                const dist  = (0.3 + Math.random() * 0.7) * radius;
+                const tx = Math.floor(originX + Math.cos(angle) * dist);
+                const tz = Math.floor(originZ + Math.sin(angle) * dist);
                 eBot.pathfinder.setMovements(eMove);
-                eBot.pathfinder.setGoal(new GoalBlock(
-                  Math.floor(originX + Math.cos(angle) * dist),
-                  Math.floor(eBot.entity.position.y),
-                  Math.floor(originZ + Math.sin(angle) * dist)
-                ));
-              } catch(e) {}
-              doStep();
-            }, delay);
+                // Attend l'arrivée — timeout 15s si chemin bloqué → nouvelle direction
+                await Promise.race([
+                  eBot.pathfinder.goto(new GoalXZ(tx, tz)),
+                  new Promise((_, rej) => setTimeout(() => rej(new Error('nav_timeout')), 15000)),
+                ]);
+              } catch(e) {
+                // Obstacle, chemin impossible ou timeout → autre direction au prochain tour
+              }
+              // Pause naturelle entre les déplacements (1–4 s) comme un vrai joueur
+              await new Promise(r => setTimeout(r, 1000 + Math.floor(Math.random() * 3000)));
+            }
           };
-          doStep();
+          walkLoop();
 
-          // Pauses aléatoires
+          // Pauses aléatoires indépendantes (2–5 min de marche, 15–60 s de pause)
           const schedulePause = () => {
             setTimeout(() => {
               if (myConnId !== connectionId) return;
@@ -1451,88 +1462,106 @@ function makeBot(index) {
         // ── Lit la nuit (shared bed tracker) ──
         if (config.modules && config.modules.beds && config.beds && config.beds["place-night"]) {
           let myBedKey = null;
-          // IDs de blocs lit calculés une fois au spawn
           const _bedIds = Object.values(eMcData.blocksByName)
             .filter(b => b.name && b.name.includes("_bed"))
             .map(b => b.id);
 
-          // Lits refusés par le serveur cette nuit (villageois, etc.) — remis à zéro à l'aube
           const nightBlacklist = new Set();
           let _wasNight = false;
-          let _lastSleepFailAt = 0;
+          let _noLitMsgSentThisNight = false;
 
+          // Préfixe commun des noms de bots pour distinguer vrais joueurs
+          const _botPrefix = (config["bot-account"].username || "Bot").replace(/\d+$/, "");
+
+          // Retourne les deux clés (tête + pied) d'un bloc lit
+          const bedBlockKeys = (b) => {
+            const keys = [`${Math.floor(b.position.x)},${Math.floor(b.position.y)},${Math.floor(b.position.z)}`];
+            for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+              const nb = eBot.blockAt(b.position.offset(dx, 0, dz));
+              if (nb && nb.name === b.name) {
+                keys.push(`${Math.floor(nb.position.x)},${Math.floor(nb.position.y)},${Math.floor(nb.position.z)}`);
+                break;
+              }
+            }
+            return keys;
+          };
+
+          // Tentative de sommeil — appelée depuis le setInterval ET depuis playerSleep
+          const tryToSleepNow = async () => {
+            if (!eBot || !connected || botSleeping || eBot.isSleeping) return;
+            const tod = eBot?.time?.timeOfDay ?? -1;
+            if (!(tod >= 12541 && tod <= 23458)) return;
+
+            let bed = null, myBedKeys = [];
+            for (const id of _bedIds) {
+              const b = eBot.findBlock({ matching: id, maxDistance: 20 });
+              if (!b) continue;
+              const keys = bedBlockKeys(b);
+              if (keys.some(k => occupiedBeds.has(k) || nightBlacklist.has(k))) continue;
+              bed = b; myBedKeys = keys; break;
+            }
+            if (!bed) {
+              // Aucun lit trouvé — dire dans le chat, une seule fois par nuit
+              if (!_noLitMsgSentThisNight) {
+                _noLitMsgSentThisNight = true;
+                try { eBot.chat("je trouve pas de lit"); } catch(e) {}
+                addLog(`[Bot#${index}] Aucun lit libre trouvé — message envoyé dans le chat`);
+              }
+              return;
+            }
+
+            myBedKey = myBedKeys[0];
+            myBedKeys.forEach(k => occupiedBeds.add(k));
+            botSleeping = true;
+            try { eBot.pathfinder.setGoal(null); } catch(_) {}
+            let serverRefused = false;
+            try {
+              await eBot.pathfinder.goto(new GoalNear(bed.position.x, bed.position.y, bed.position.z, 2));
+              await eBot.sleep(bed);
+              addLog(`[Bot#${index}] 😴 Dort dans le lit ${myBedKey}`);
+            } catch(e) {
+              const msg = e.message || '';
+              if (msg.includes('occupied') || msg.includes('villager')) {
+                myBedKeys.forEach(k => nightBlacklist.add(k));
+                addLog(`[Bot#${index}] Lit ${myBedKey} bloqué (villageois?) — ignoré cette nuit`);
+                serverRefused = true;
+              } else {
+                addLog(`[Bot#${index}] Échec sommeil: ${msg}`);
+              }
+            } finally {
+              botSleeping = false;
+              if (!serverRefused) myBedKeys.forEach(k => occupiedBeds.delete(k));
+              myBedKeys = []; myBedKey = null;
+            }
+          };
+
+          // Vérification périodique chaque nuit
           setInterval(async () => {
             if (myConnId !== connectionId) return;
             const tod = eBot?.time?.timeOfDay ?? -1;
             const isNight = tod >= 12541 && tod <= 23458;
-            // Remettre à zéro la blacklist à l'aube
-            if (_wasNight && !isNight) { nightBlacklist.clear(); _lastSleepFailAt = 0; }
+            if (_wasNight && !isNight) {
+              nightBlacklist.clear();
+              _noLitMsgSentThisNight = false;
+            }
             _wasNight = isNight;
-            if (!eBot || !connected || botSleeping || eBot.isSleeping) return;
-            // Cooldown de 60s après un échec pour éviter de spammer le serveur
-            if (Date.now() - _lastSleepFailAt < 60000) return;
-            try {
-              if (!isNight) return;
-              // Chercher un lit libre dans 50 blocs via IDs (plus fiable que matching function)
-              // Récupère les 2 clés d'un lit (tête + pied sont des blocs adjacents de même nom)
-              const bedBlockKeys = (b) => {
-                const keys = [`${Math.floor(b.position.x)},${Math.floor(b.position.y)},${Math.floor(b.position.z)}`];
-                const offsets = [[1,0],[-1,0],[0,1],[0,-1]];
-                for (const [dx,dz] of offsets) {
-                  const nb = eBot.blockAt(b.position.offset(dx, 0, dz));
-                  if (nb && nb.name === b.name) {
-                    keys.push(`${Math.floor(nb.position.x)},${Math.floor(nb.position.y)},${Math.floor(nb.position.z)}`);
-                    break;
-                  }
-                }
-                return keys;
-              };
-
-              let bed = null;
-              let myBedKeys = [];
-              for (const id of _bedIds) {
-                const b = eBot.findBlock({ matching: id, maxDistance: 20 });
-                if (!b) continue;
-                const keys = bedBlockKeys(b);
-                // Ignorer si occupé par un autre bot OU blacklisté pour cette nuit
-                if (keys.some(k => occupiedBeds.has(k) || nightBlacklist.has(k))) continue;
-                bed = b; myBedKeys = keys; break;
-              }
-              if (!bed) return; // reste en place silencieusement
-              myBedKey = myBedKeys[0];
-              myBedKeys.forEach(k => occupiedBeds.add(k));
-              botSleeping = true;
-              try { eBot.pathfinder.setGoal(null); } catch(_) {}
-              let serverRefused = false;
-              try {
-                await eBot.pathfinder.goto(new GoalNear(bed.position.x, bed.position.y, bed.position.z, 2));
-                await eBot.sleep(bed);
-                addLog(`[Bot#${index}] 😴 Dort dans le lit ${myBedKey}`);
-              } catch(e) {
-                const msg = e.message || '';
-                _lastSleepFailAt = Date.now();
-                if (msg.includes('occupied') || msg.includes('villager')) {
-                  // Lit revendiqué par un villageois — blacklister pour cette nuit
-                  myBedKeys.forEach(k => nightBlacklist.add(k));
-                  addLog(`[Bot#${index}] Lit ${myBedKey} bloqué (villageois?) — ignoré cette nuit`);
-                  serverRefused = true;
-                } else {
-                  addLog(`[Bot#${index}] Échec sommeil: ${msg}`);
-                }
-              } finally {
-                botSleeping = false;
-                // Si le serveur a refusé, le lit reste dans occupiedBeds pour éviter de réessayer
-                if (!serverRefused) {
-                  myBedKeys.forEach(k => occupiedBeds.delete(k));
-                }
-                myBedKeys = []; myBedKey = null;
-              }
-            } catch(e) {
+            if (!eBot || !connected || botSleeping || eBot.isSleeping || !isNight) return;
+            try { await tryToSleepNow(); } catch(e) {
               addLog(`[Bot#${index}] [sleep-err] ${e.message}`);
               botSleeping = false;
               if (myBedKey) { occupiedBeds.delete(myBedKey); myBedKey = null; }
             }
-          }, 15000);
+          }, 10000);
+
+          // Quand un vrai joueur se couche, les bots essaient de dormir immédiatement
+          // → les bots ne bloquent plus la nuit du joueur
+          eBot.on('playerSleep', (entity) => {
+            if (!entity || !entity.username) return;
+            if (entity.username === eBot.username) return;
+            if (entity.username.startsWith(_botPrefix)) return; // c'est un autre bot
+            // C'est un vrai joueur → dormir immédiatement
+            tryToSleepNow().catch(() => {});
+          });
         }
 
         // ── Anti-AFK : regard aléatoire supplémentaire (remplace swingArm pour éviter le geste de cassage) ──
